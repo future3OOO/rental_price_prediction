@@ -1,0 +1,33 @@
+{
+    "MAE": 45.99150665068715,
+    "R2_Score": 0.5502034379002297,
+    "MAPE": 7.96762165777286,
+    "Cross_Val_MAE_Scores": [
+        52.97912932449438,
+        51.88051173489757
+    ],
+    "Mean_CV_MAE": 52.429820529695974,
+    "Model_Params": {
+        "iterations": 2875,
+        "learning_rate": 0.06527120581867439,
+        "depth": 9,
+        "l2_leaf_reg": 2.6535051667623267e-05,
+        "loss_function": "RMSE",
+        "random_seed": 42,
+        "verbose": 100,
+        "bagging_temperature": 0.46109902543568326,
+        "cat_features": [
+            "Active Listing",
+            "Suburb"
+        ]
+    },
+    "Best_Trial_Params": {
+        "iterations": 2875,
+        "learning_rate": 0.06527120581867439,
+        "depth": 9,
+        "l2_leaf_reg": 2.6535051667623267e-05,
+        "bagging_temperature": 0.46109902543568326
+    },
+    "Best_Trial_Value": 50.77458340250665,
+    "Number_of_Trials": 10
+}

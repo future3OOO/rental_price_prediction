@@ -1,0 +1,82 @@
+Feature,Mean Absolute SHAP
+Floor Size (sqm),25.608685
+Bed,24.833689
+Car,12.579664
+Land Size (sqm),12.525019
+Bath,10.867797
+Floor_Size_x_Bed,7.3564057
+Floor_Size_x_Bath,6.495023
+"Suburb_Upper Riccarton, Christchurch",6.4127235
+Capital Value,4.3708773
+"Suburb_Linwood, Christchurch",4.2649693
+"Suburb_Ilam, Christchurch",3.7766287
+"Suburb_Riccarton, Christchurch",3.4324389
+"Suburb_St Albans, Christchurch",2.237403
+"Suburb_Phillipstown, Christchurch",2.2170541
+"Suburb_Merivale, Christchurch",1.8152701
+"Suburb_Burnside, Christchurch",1.636391
+"Suburb_Waltham, Christchurch",1.5661396
+"Suburb_Sydenham, Christchurch",1.4600384
+"Suburb_Fendalton, Christchurch",1.3950542
+"Suburb_Woolston, Christchurch",0.94599944
+"Suburb_Bryndwr, Christchurch",0.9122561
+"Suburb_Richmond, Christchurch",0.8181223
+"Suburb_Addington, Christchurch",0.77519435
+"Suburb_Cashmere, Christchurch",0.7351642
+"Suburb_Sockburn, Christchurch",0.6756583
+"Suburb_Avonhead, Christchurch",0.6224708
+"Suburb_Mount Pleasant, Christchurch",0.57485855
+"Suburb_Sumner, Christchurch",0.5511989
+"Suburb_Edgeware, Christchurch",0.41654664
+"Suburb_Hillsborough, Christchurch",0.3376236
+"Suburb_Redcliffs, Christchurch",0.30310535
+"Suburb_Westmorland, Christchurch",0.23826632
+"Suburb_Bromley, Christchurch",0.21416976
+"Suburb_Moncks Bay, Christchurch",0.20775695
+"Suburb_Saint Martins, Christchurch",0.18810017
+"Suburb_Southshore, Christchurch",0.1782077
+"Suburb_New Brighton, Christchurch",0.17586091
+"Suburb_Avonside, Christchurch",0.17585972
+"Suburb_Mairehau, Christchurch",0.17415538
+"Suburb_Shirley, Christchurch",0.13512291
+"Suburb_Clifton, Christchurch",0.122543424
+"Suburb_Belfast, Christchurch",0.12116983
+"Suburb_Islington, Christchurch",0.112362854
+"Suburb_Wainoni, Christchurch",0.10205727
+"Suburb_Strowan, Christchurch",0.09442514
+"Suburb_Halswell, Christchurch",0.081731044
+"Suburb_Wigram, Christchurch",0.0800877
+"Suburb_Somerfield, Christchurch",0.0771356
+"Suburb_Russley, Christchurch",0.07375736
+"Suburb_Heathcote Valley, Christchurch",0.07131898
+"Suburb_Bishopdale, Christchurch",0.06708464
+"Suburb_Hei Hei, Christchurch",0.0523235
+"Suburb_Hornby, Christchurch",0.05091709
+"Suburb_Scarborough, Christchurch",0.03996573
+"Suburb_Dallington, Christchurch",0.028496454
+"Suburb_Broomfield, Christchurch",0.017609663
+"Suburb_Cracroft, Christchurch",0.015782129
+"Suburb_Casebrook, Christchurch",0.0146893365
+"Suburb_Beckenham, Christchurch",0.013642334
+"Suburb_Huntsbury, Christchurch",0.012259322
+"Suburb_Papanui, Christchurch",0.011585599
+"Suburb_Aidanfield, Christchurch",0.0110061355
+"Suburb_Burwood, Christchurch",0.0057008346
+"Suburb_Ferrymead, Christchurch",0.0044356864
+"Suburb_Opawa, Christchurch",0.0039074905
+"Suburb_Northcote, Christchurch",0.0031288583
+"Suburb_Spreydon, Christchurch",0.0023944909
+"Suburb_Hoon Hay, Christchurch",0.0023942105
+"Suburb_Northwood, Christchurch",0.0021320167
+"Suburb_Templeton, Christchurch",0.0013296528
+"Suburb_Waimairi Beach, Christchurch",0.0
+"Suburb_Harewood, Christchurch",0.0
+"Suburb_Avondale, Christchurch",0.0
+"Suburb_Bexley, Christchurch",0.0
+"Suburb_Hillmorton, Christchurch",0.0
+"Suburb_Parklands, Christchurch",0.0
+Suburb_Cluster,0.0
+Month_sin,0.0
+Month_cos,0.0
+"Suburb_Redwood, Christchurch",0.0
+"Suburb_Richmond Hill, Christchurch",0.0

@@ -1,0 +1,49 @@
+{
+  "rules": [
+    
+    {
+      "title": "Compatibility Analysis and Change Impact Rules",
+      "rules": [
+        "Before making any changes, all files in the project directory must be analyzed for compatibility to ensure no breaking changes are made.",
+        "You are not authorized to make any changes until you understand the impact of each file and how it functions within the project.",
+        "This analysis must be done every time changes are proposed or implemented."
+      ]
+    },
+{
+      "description": "Use the latest machine learning techniques to build a competitive rental price prediction model.",
+      "example": "Implement advanced ensemble methods, primarily using CatBoost, and explore alternatives."
+    },
+    {
+      "description": "Analyze log files, question all errors in the logs and identify all issues and bottlenecks for improvement in the current model.",
+      "example": "Review errors, warnings, and runtime performances to pinpoint and resolve issues and discover optimization opportunities."
+    },
+    {
+      "description": "Continuously question assumptions to discover new insights or methods.",
+      "example": "Look for gaps in current logic, use analogies to better understand issues with the logic, implement new features that could improve model accuracy."
+    },
+    {
+      "description": "Ensure all code modifications preserve critical components essential for model integrity.",
+      "example": "Test alternate configurations without removing core functionalities to assess impact on performance."
+    },
+    {
+      "description": "Enhance data processing and feature engineering for better model input quality.",
+      "example": "Implement techniques like feature scaling, selection, or synthesis based on data analysis."
+    },
+    {
+      "description": "Write production-ready, scalable code that ensures high efficiency and performance.",
+      "example": "Optimize functions and employ parallel processing to enhance computation speed."
+    },
+    {
+      "description": "Use rigorous validation strategies to certify model accuracy and reliability.",
+      "example": "Integrate cross-validation and automate performance tracking across datasets."
+    },
+    {
+      "description": "Focus on continuous model improvement using real-time data feedback.",
+      "example": "Integrate feedback loops and setup a data pipeline for real-time data ingestion and in-line model training updates."
+    },
+    {
+      "description": "Ensure all data and features, including capital value, are accurately reflected in prediction.py.",
+      "example": "Regularly validate and update prediction logic to incorporate all relevant features and data components to maintain alignment with the business objectives."
+    }
+  ]
+}

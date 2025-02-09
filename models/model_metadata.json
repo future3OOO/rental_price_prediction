@@ -1,0 +1,53 @@
+{
+    "MAE": 47.71830917067714,
+    "R2_Score": 0.6247286082499324,
+    "MAPE": 8.464364328714924,
+    "feature_names": [
+        "Bath",
+        "Car",
+        "Land Size (sqm)",
+        "Floor Size (sqm)",
+        "Year Built",
+        "Days on Market",
+        "Land Value",
+        "Capital Value",
+        "VWAP_3M",
+        "Month_sin",
+        "Month_cos",
+        "Time_Index",
+        "Active Listing",
+        "Suburb",
+        "Bed"
+    ],
+    "best_params": {
+        "iterations": 1963,
+        "learning_rate": 0.06674755057815325,
+        "depth": 7,
+        "l2_leaf_reg": 0.04997857055533964,
+        "bagging_temperature": 0.40179596542625706,
+        "random_strength": 0.46493487960457336,
+        "border_count": 187
+    },
+    "cat_features_indices": [
+        12,
+        13,
+        14
+    ],
+    "date_column": "Last Rental Date",
+    "numeric_features": [
+        "Bath",
+        "Car",
+        "Land Size (sqm)",
+        "Floor Size (sqm)",
+        "Year Built",
+        "Days on Market",
+        "Land Value",
+        "Capital Value",
+        "VWAP_3M"
+    ],
+    "categorical_features": [
+        "Active Listing",
+        "Suburb",
+        "Bed"
+    ]
+}
