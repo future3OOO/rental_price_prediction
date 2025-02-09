@@ -16,4 +16,7 @@ rental_price_prediction/
 ├── prediction.py
 ├── reproducibility.py
 ├── statistical_tests.py
-├── time_series_analysi
+├── time_series_analysis.py
+├── utils.py
+├── view_model.py
+└── requirements.txt
