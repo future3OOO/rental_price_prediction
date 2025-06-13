@@ -1,0 +1,205 @@
+{
+  "rules": [
+    {
+      "title": "CatBoost Model Architecture and Optimization Rules",
+      "rules": [
+        "Before making any model architecture changes, all pipeline components must be analyzed for compatibility to ensure no breaking changes in the prediction flow.",
+        "Use CatBoost as the primary algorithm but implement ensemble methods combining CatBoost with LightGBM and XGBoost for improved robustness.",
+        "Implement advanced hyperparameter tuning using Optuna with minimum 50 trials (current: 5 trials) and Bayesian optimization for better parameter space exploration.",
+        "Configure CatBoost with optimal GPU settings: task_type='GPU', devices='0', gpu_ram_part=0.7, and enable bootstrap_type='Bernoulli' for better generalization.",
+        "Implement early stopping with patience of 200 rounds and use 'Logloss' or 'RMSE' as primary metrics alongside MAE for comprehensive evaluation."
+      ]
+    },
+    {
+      "title": "Feature Engineering and Data Quality Enhancement Rules",
+      "rules": [
+        "Implement advanced feature engineering including polynomial features, binning for continuous variables, and sophisticated interaction terms beyond basic multiplication.",
+        "Create time-based features including seasonality indicators, market trend features, and rolling statistics (7-day, 30-day, 90-day moving averages).",
+        "Implement target encoding with proper cross-validation using smoothed target encoding and leave-one-out encoding for categorical variables.",
+        "Add geographical features including distance to CBD, proximity to amenities (schools, transport, shopping), and neighborhood quality indices.",
+        "Implement feature selection using recursive feature elimination, mutual information, and correlation analysis to remove redundant features and improve model interpretability."
+      ]
+    },
+    {
+      "title": "Data Validation and Quality Assurance Rules",
+      "rules": [
+        "Implement comprehensive data validation pipelines using Great Expectations or similar frameworks to ensure data quality and consistency.",
+        "Create automated data drift detection to monitor changes in feature distributions and trigger model retraining when drift is detected.",
+        "Implement outlier detection using multiple methods (IQR, Z-score, Isolation Forest) and create separate handling strategies for different types of outliers.",
+        "Establish data lineage tracking to monitor the entire data pipeline from source to model predictions.",
+        "Implement automated data profiling and generate regular data quality reports highlighting anomalies, missing values, and distribution changes."
+      ]
+    },
+    {
+      "title": "Model Performance and Validation Rules",
+      "rules": [
+        "Implement stratified cross-validation with time-series split to ensure robust model evaluation while respecting temporal dependencies.",
+        "Use multiple evaluation metrics including MAE, RMSE, MAPE, symmetric MAPE, and custom business metrics like prediction accuracy within ±10% range.",
+        "Implement walk-forward validation for time-series data to simulate real-world prediction scenarios and assess model stability over time.",
+        "Create holdout test sets representing different market conditions (bull, bear, stable markets) to test model robustness across economic cycles.",
+        "Implement confidence intervals and prediction intervals using quantile regression or bootstrapping methods for uncertainty quantification."
+      ]
+    },
+    {
+      "title": "Pipeline Reliability and Error Handling Rules",
+      "rules": [
+        "Fix the current pipeline issues with DateTransformer and FeatureEngineering steps that are causing 'get_feature_names_out' errors in prediction.py.",
+        "Implement robust error handling with detailed logging, retry mechanisms, and graceful degradation when components fail.",
+        "Create comprehensive unit tests covering all pipeline components, edge cases, and data transformation steps with minimum 90% code coverage.",
+        "Implement pipeline versioning and model registry to track different versions and enable rollback capabilities when issues are detected.",
+        "Establish comprehensive monitoring for pipeline health, execution times, and resource utilization with alerting for anomalies."
+      ]
+    },
+    {
+      "title": "Real-time Learning and Model Updates Rules",
+      "rules": [
+        "Implement online learning capabilities to update model parameters with new data points without full retraining for faster adaptation to market changes.",
+        "Create automated model retraining pipelines triggered by performance degradation, data drift, or scheduled intervals (weekly/monthly).",
+        "Implement A/B testing framework to compare new model versions against current production models before deployment.",
+        "Establish feedback loops to incorporate prediction accuracy into model improvements and learn from prediction errors.",
+        "Create adaptive learning rates and model ensemble weights that adjust based on recent prediction performance and market conditions."
+      ]
+    },
+    {
+      "title": "Advanced Analytics and Interpretability Rules",
+      "rules": [
+        "Implement advanced SHAP analysis beyond basic summary plots including dependency plots, interaction effects, and local explanations for individual predictions.",
+        "Create model interpretation dashboards showing feature importance evolution over time, prediction confidence distributions, and error analysis.",
+        "Implement LIME (Local Interpretable Model-agnostic Explanations) for individual prediction explanations to complement SHAP analysis.",
+        "Generate automated model performance reports including feature drift analysis, prediction accuracy trends, and comparative analysis with baseline models.",
+        "Create business impact analysis linking model predictions to actual rental outcomes and revenue optimization opportunities."
+      ]
+    },
+    {
+      "title": "Production Deployment and Scaling Rules",
+      "rules": [
+        "Implement containerized deployment using Docker with optimized images for CatBoost models and GPU acceleration support.",
+        "Create API endpoints with proper authentication, rate limiting, and request validation for real-time predictions.",
+        "Implement model serving with load balancing, auto-scaling, and health checks to ensure high availability and performance.",
+        "Establish CI/CD pipelines for automated testing, model validation, and deployment with proper staging environments.",
+        "Implement comprehensive logging, monitoring, and alerting for production model performance, latency, and error rates."
+      ]
+    },
+    {
+      "title": "Data Pipeline and Infrastructure Rules",
+      "rules": [
+        "Implement automated data ingestion pipelines with proper error handling, data validation, and backup mechanisms.",
+        "Create data versioning and lineage tracking to maintain reproducibility and enable debugging of model issues.",
+        "Implement caching strategies for frequently accessed data and computed features to improve pipeline performance.",
+        "Establish data archiving and retention policies to manage storage costs while maintaining historical data for model improvement.",
+        "Create disaster recovery procedures including data backup, model checkpoint saving, and infrastructure redundancy."
+      ]
+    },
+    {
+      "title": "Business Intelligence and Market Analysis Rules",
+      "rules": [
+        "Implement market trend analysis using external data sources (economic indicators, interest rates, population growth) to enhance prediction accuracy.",
+        "Create competitor analysis features including comparative pricing, market share analysis, and competitive positioning indicators.",
+        "Implement seasonal adjustment factors and holiday effects to account for temporary market fluctuations in rental demand.",
+        "Create market segment analysis to identify different pricing strategies for luxury, mid-range, and budget rental properties.",
+        "Implement customer behavior analysis to understand rental patterns, preferences, and price sensitivity across different demographic segments."
+      ]
+    },
+    {
+      "title": "Continuous Improvement and Research Rules",
+      "rules": [
+        "Establish regular model performance reviews with stakeholders to identify improvement opportunities and business requirement changes.",
+        "Implement experimental framework for testing new algorithms, features, and modeling approaches without disrupting production systems.",
+        "Create research and development pipeline for exploring cutting-edge ML techniques like transformer-based models, graph neural networks for property relationships.",
+        "Establish partnerships with academic institutions or research organizations to stay current with latest developments in real estate price prediction.",
+        "Implement systematic approach to hypothesis testing and statistical analysis for feature importance, model assumptions, and prediction accuracy improvements."
+      ]
+    },
+    {
+      "title": "Monitoring and Alerting Rules",
+      "rules": [
+        "Implement real-time monitoring of model prediction accuracy, feature drift, and data quality issues with automated alerting.",
+        "Create dashboards showing key performance indicators including prediction error trends, model confidence distributions, and business impact metrics.",
+        "Establish automated anomaly detection for unusual prediction patterns, data distribution changes, and system performance issues.",
+        "Implement comprehensive logging strategy capturing all model inputs, outputs, processing times, and error conditions for debugging and optimization.",
+        "Create regular performance reports for stakeholders showing model accuracy, business impact, and improvement recommendations."
+      ]
+    }
+  ],
+  "implementation_priorities": [
+    {
+      "priority": "CRITICAL",
+      "description": "Fix current pipeline errors in prediction.py related to DateTransformer and feature engineering compatibility issues.",
+      "timeline": "Immediate (1-2 days)"
+    },
+    {
+      "priority": "HIGH", 
+      "description": "Implement advanced hyperparameter tuning with Optuna (minimum 50 trials) and ensemble methods for improved model performance.",
+      "timeline": "1-2 weeks"
+    },
+    {
+      "priority": "HIGH",
+      "description": "Create comprehensive data validation and quality assurance pipelines to ensure model reliability.",
+      "timeline": "2-3 weeks"
+    },
+    {
+      "priority": "MEDIUM",
+      "description": "Implement advanced feature engineering including geographical features and sophisticated interaction terms.",
+      "timeline": "3-4 weeks"
+    },
+    {
+      "priority": "MEDIUM",
+      "description": "Establish production deployment infrastructure with monitoring, alerting, and automated retraining capabilities.",
+      "timeline": "4-6 weeks"
+    },
+    {
+      "priority": "LOW",
+      "description": "Implement research and development framework for exploring advanced ML techniques and market analysis features.",
+      "timeline": "2-3 months"
+    }
+  ],
+  "success_metrics": [
+    {
+      "metric": "Prediction Accuracy",
+      "target": "Achieve MAPE < 8% and MAE < $50 for rental price predictions",
+      "current_baseline": "Monitor current MAPE and MAE from model training logs"
+    },
+    {
+      "metric": "Model Robustness", 
+      "target": "Maintain prediction accuracy within 2% across different market conditions and property types",
+      "measurement": "Cross-validation scores and holdout test performance"
+    },
+    {
+      "metric": "Pipeline Reliability",
+      "target": "99.5% uptime for prediction pipeline with < 500ms average response time",
+      "measurement": "System monitoring and performance metrics"
+    },
+    {
+      "metric": "Business Impact",
+      "target": "Improve rental pricing decisions resulting in 5-10% increase in revenue optimization",
+      "measurement": "A/B testing and business outcome tracking"
+    }
+  ],
+  "technical_debt_items": [
+    {
+      "item": "DateTransformer compatibility issues causing prediction failures",
+      "severity": "CRITICAL",
+      "effort": "1-2 days"
+    },
+    {
+      "item": "Limited hyperparameter tuning (only 5 Optuna trials)",
+      "severity": "HIGH", 
+      "effort": "3-5 days"
+    },
+    {
+      "item": "Lack of comprehensive error handling and logging",
+      "severity": "MEDIUM",
+      "effort": "1-2 weeks"
+    },
+    {
+      "item": "Missing data validation and quality checks",
+      "severity": "MEDIUM",
+      "effort": "2-3 weeks"
+    },
+    {
+      "item": "Limited model interpretability and explanation capabilities",
+      "severity": "LOW",
+      "effort": "1-2 weeks"
+    }
+  ]
+}
