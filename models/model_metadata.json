@@ -1,53 +1,86 @@
 {
-    "MAE": 47.71830917067714,
-    "R2_Score": 0.6247286082499324,
-    "MAPE": 8.464364328714924,
-    "feature_names": [
+    "BestModel": "CatBoost",
+    "MAE": 28691.03870397908,
+    "R2_Score": 0.3129383574179675,
+    "MAPE": 38.04250250521558,
+    "RMSE": 53130.76770156575,
+    "cat_features": [
+        "Active Listing",
+        "Suburb",
+        "Bed"
+    ],
+    "cat_features_transformed_names": null,
+    "CatBoost_params": {
+        "task_type": "GPU",
+        "devices": "0",
+        "loss_function": "MAE",
+        "eval_metric": "MAE",
+        "random_seed": 42,
+        "verbose": 100,
+        "gpu_ram_part": 0.9,
+        "allow_writing_files": false,
+        "iterations": 4000,
+        "depth": 8,
+        "border_count": 234,
+        "leaf_estimation_method": "Gradient",
+        "leaf_estimation_iterations": 1,
+        "learning_rate": 0.027210761882825944,
+        "l2_leaf_reg": 4.701485901012517,
+        "random_strength": 1.0048968509375626,
+        "bagging_temperature": 1.858255209712563,
+        "metric_period": 1,
+        "early_stopping_rounds": 100
+    },
+    "feature_names_after_transformation": [
         "Bath",
         "Car",
         "Land Size (sqm)",
         "Floor Size (sqm)",
         "Year Built",
         "Days on Market",
-        "Land Value",
         "Capital Value",
-        "VWAP_3M",
+        "Suburb_LOO",
+        "SuburbMonth_LOO",
+        "Land_Value_log",
         "Month_sin",
         "Month_cos",
         "Time_Index",
+        "Floor Size (sqm)_x_Land Size (sqm)",
+        "Bath_x_Car",
         "Active Listing",
         "Suburb",
         "Bed"
     ],
-    "best_params": {
-        "iterations": 1963,
-        "learning_rate": 0.06674755057815325,
-        "depth": 7,
-        "l2_leaf_reg": 0.04997857055533964,
-        "bagging_temperature": 0.40179596542625706,
-        "random_strength": 0.46493487960457336,
-        "border_count": 187
-    },
-    "cat_features_indices": [
-        12,
-        13,
-        14
+    "training_date_range": [
+        "2021-06-11",
+        "2025-06-05"
     ],
-    "date_column": "Last Rental Date",
-    "numeric_features": [
+    "test_date_range": [
+        "NA",
+        "NA"
+    ],
+    "data_shape_before_split": [
+        139,
+        18
+    ],
+    "train_data_shape": [
+        111,
+        18
+    ],
+    "test_data_shape": [
+        28,
+        18
+    ],
+    "final_numeric_features_used": [
         "Bath",
         "Car",
         "Land Size (sqm)",
         "Floor Size (sqm)",
         "Year Built",
         "Days on Market",
-        "Land Value",
         "Capital Value",
-        "VWAP_3M"
-    ],
-    "categorical_features": [
-        "Active Listing",
-        "Suburb",
-        "Bed"
+        "Suburb_LOO",
+        "SuburbMonth_LOO",
+        "Land_Value_log"
     ]
 }
