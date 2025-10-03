@@ -15,6 +15,221 @@ import json
 import re
 from typing import List, Dict, Tuple, Optional
 import hashlib
+from pathlib import Path
+
+from log_policy import ALLOWED_LOG_FEATURES, apply_log_policy
+
+UNWANTED_FEATURES = {
+    "Month",
+    "Month_sin",
+    "Month_cos",
+    "has_car",
+    "has_two_car",
+    "has_three_plus_car",
+    "is_newer_2010",
+}
+GEO_COLUMNS = {"Latitude", "Longitude"}
+
+
+
+_FURNISHINGS_CANONICAL = {
+    # Train-time uses lowercase categories; keep serve-time identical
+    "unfurnished": "unfurnished",
+    "furnished": "furnished",
+    "partially furnished": "partially furnished",
+    "partial": "partially furnished",
+    "fully furnished": "furnished",
+    "full": "furnished",
+}
+
+
+def _canonicalize_furnishings(value: object) -> str:
+    """Return lowercase categories to match training artifacts.
+
+    Expected outputs: 'unfurnished' | 'furnished' | 'partially furnished'.
+    Unknown/empty → 'unfurnished'.
+    """
+    if value is None:
+        return "unfurnished"
+    if isinstance(value, float) and np.isnan(value):
+        return "unfurnished"
+    text = str(value).strip()
+    if not text:
+        return "unfurnished"
+    lower = text.lower()
+    if lower in {"nill", "nil", "none", "null"}:
+        return "unfurnished"
+    if "fully" in lower and "furnish" in lower:
+        return "furnished"
+    if "partial" in lower:
+        return "partially furnished"
+    return _FURNISHINGS_CANONICAL.get(lower, lower)
+
+
+_PETS_CANONICAL = {
+    "no": "No Pets",
+    "no pets": "No Pets",
+    "not allowed": "No Pets",
+    "pets not allowed": "No Pets",
+    "pets ok": "Pets Allowed",
+    "pets allowed": "Pets Allowed",
+    "yes": "Pets Allowed",
+    "pet friendly": "Pets Allowed",
+    "pets negotiable": "Pets Negotiable",
+    "negotiable": "Pets Negotiable",
+}
+
+
+def _canonicalize_pets(value: object) -> str:
+    if value is None:
+        return "No Pets"
+    if isinstance(value, float) and np.isnan(value):
+        return "No Pets"
+    text_val = str(value).strip()
+    if not text_val:
+        return "No Pets"
+    lower = text_val.lower()
+    if lower in {"nill", "nil", "none", "null"}:
+        return "No Pets"
+    if "pets ok" in lower or "pet ok" in lower:
+        return "Pets Allowed"
+    if "allow" in lower and "pet" in lower:
+        return "Pets Allowed"
+    if "friendly" in lower and "pet" in lower:
+        return "Pets Allowed"
+    if "negotiable" in lower and "pet" in lower:
+        return "Pets Negotiable"
+    if lower in _PETS_CANONICAL:
+        return _PETS_CANONICAL[lower]
+    if lower == "ok":
+        return "Pets Allowed"
+    return text_val.title()
+
+
+_GARAGE_CANONICAL = {
+    "no": "No Garage",
+    "none": "No Garage",
+    "nil": "No Garage",
+    "n": "No Garage",
+    "0": "No Garage",
+    "yes": "Yes",
+    "y": "Yes",
+}
+
+
+def _canonicalize_garage(value: object) -> str:
+    if value is None:
+        return "No Garage"
+    if isinstance(value, float) and np.isnan(value):
+        return "No Garage"
+    text_val = str(value).strip()
+    if not text_val:
+        return "No Garage"
+    lower = text_val.lower()
+    if lower in _GARAGE_CANONICAL:
+        return _GARAGE_CANONICAL[lower]
+    if "no garage" in lower:
+        return "No Garage"
+    return text_val.title()
+
+
+def _apply_feature_policy(df: pd.DataFrame, *, drop_geo: bool = True) -> pd.DataFrame:
+    df = apply_log_policy(df, drop_raw=True)
+    clip_km = float(os.getenv("GEO_CLIP_DIST_KM", "0") or 0)
+    if clip_km > 0:
+        for col in [c for c in df.columns if re.match(r"^dist_.*_km$", str(c))]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").clip(upper=clip_km)
+    drop = [c for c in UNWANTED_FEATURES if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop, errors="ignore")
+    if drop_geo:
+        geo_drop = [c for c in GEO_COLUMNS if c in df.columns]
+        if geo_drop:
+            df = df.drop(columns=geo_drop, errors="ignore")
+    return df
+
+
+def _geocode_missing_latlon(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "Latitude" not in df.columns:
+        df["Latitude"] = np.nan
+    if "Longitude" not in df.columns:
+        df["Longitude"] = np.nan
+    mask = df["Latitude"].isna() | df["Longitude"].isna()
+    if not mask.any():
+        return df
+    if NominatimGeocoder is None or compose_address is None:
+        logging.debug("Geocoder not available; skipping lookup for missing coordinates")
+        return df
+    geocoder = None
+    try:
+        geocoder = NominatimGeocoder()
+    except Exception as exc:
+        logging.debug("Unable to initialise geocoder: %s", exc)
+    for idx in df[mask].index:
+        row = df.loc[idx]
+        try:
+            addr = compose_address(
+                row,
+                street_cols=("Street Address", "street_address"),
+                suburb_col="Suburb",
+                city_col="City",
+                postcode_col="Postcode",
+            )
+        except Exception as exc:
+            logging.debug("Compose address failed for index %s: %s", idx, exc)
+            addr = None
+        query_val = str(row.get("__geo_query__", "")).strip()
+        if not query_val:
+            query_val = addr or ""
+        if not addr:
+            logging.debug("No address components available for geocoding index %s", idx)
+            continue
+        try:
+            result = geocoder.geocode(addr)
+        except Exception as exc:
+            logging.debug("Geocode lookup failed for %s: %s", addr, exc)
+            continue
+        if result and getattr(result, "ok", False):
+            try:
+                lat_val = float(result.lat)
+                lon_val = float(result.lon)
+                df.at[idx, "Latitude"] = lat_val
+                df.at[idx, "Longitude"] = lon_val
+                logging.info("Geocoded %s -> (%0.6f, %0.6f)", addr, lat_val, lon_val)
+            except Exception as exc:
+                logging.debug("Failed to assign geocode result for %s: %s", addr, exc)
+                continue
+            try:
+                _append_geocode_result(query_val or result.query, lat_val, lon_val)
+            except Exception:
+                logging.debug("Failed to persist geocode result for %s", addr)
+    if geocode_properties is not None:
+        try:
+            df = geocode_properties(
+                df,
+                lat_col="Latitude",
+                lon_col="Longitude",
+                street_cols=("Street Address", "street_address"),
+                suburb_col="Suburb",
+                city_col="City",
+                postcode_col="Postcode",
+                geocoder=geocoder if geocoder is not None else None,
+            )
+        except Exception as exc:
+            logging.debug("Batch geocode fallback failed: %s", exc)
+    return df
+
+def _append_geocode_result(query: str, lat: float, lon: float) -> None:
+    path = Path(os.getenv("GEOCODE_RESULTS_CSV", "artifacts/geocode_query_results.csv"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([[query, lat, lon]], columns=["query", "latitude", "longitude"])
+        df.to_csv(path, mode='a', header=not path.exists(), index=False)
+    except Exception:
+        logging.debug("Failed to append geocode result for %s", query)
+
 
 try:
     from geo_features import compute_geo_features  # optional at serve-time
@@ -22,10 +237,38 @@ except Exception:  # pragma: no cover
     compute_geo_features = None  # type: ignore
 
 try:
-    from geo_coding import assign_geo_queries, enrich_with_geocodes
+    from geo_coding import (
+        assign_geo_queries,
+        enrich_with_geocodes,
+        compose_address,
+        NominatimGeocoder,
+        geocode_properties,
+    )
 except Exception:  # pragma: no cover
     assign_geo_queries = None  # type: ignore
     enrich_with_geocodes = None  # type: ignore
+    compose_address = None  # type: ignore
+    NominatimGeocoder = None  # type: ignore
+    geocode_properties = None  # type: ignore
+
+GEO_INCLUDE_BEARINGS = os.getenv("GEO_INCLUDE_BEARINGS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+GEO_USE_ACCESSIBILITY = os.getenv("GEO_USE_ACCESSIBILITY", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+_GEO_SCHOOL_MODE_RAW = (
+    (os.getenv("GEO_SCHOOL_FEATURE", "dist_min") or "dist_min").strip().lower()
+)
+_GEO_SCHOOL_MODES = {"dist_min", "primary", "intermediate", "high"}
+
+GEO_SCHOOL_FEATURE = (
+    _GEO_SCHOOL_MODE_RAW if _GEO_SCHOOL_MODE_RAW in _GEO_SCHOOL_MODES else "dist_min"
+)
 
 # Compatibility shim for scikit-learn version drift during unpickling
 try:
@@ -58,34 +301,33 @@ logging.basicConfig(
 )
 
 
-def _find_latest_artifacts():
+def _artifact_candidates() -> List[Tuple[str, Optional[str]]]:
     try:
         art_dir = os.path.join(os.getcwd(), "artifacts")
         if not os.path.isdir(art_dir):
-            return None, None
+            return []
         candidates = []
         for name in os.listdir(art_dir):
-            if name.startswith("pipeline_") and name.endswith(".joblib"):
-                path = os.path.join(art_dir, name)
-                try:
-                    mtime = os.path.getmtime(path)
-                except Exception:
-                    mtime = 0
-                candidates.append((mtime, path))
-        if not candidates:
-            return None, None
-        candidates.sort(reverse=True)
-        latest_pipe = candidates[0][1]
-        # try to locate matching meta file
-        stem = os.path.splitext(os.path.basename(latest_pipe))[0].replace(
-            "pipeline_", ""
-        )
-        meta_path = os.path.join(art_dir, f"meta_{stem}.json")
-        if not os.path.exists(meta_path):
-            meta_path = None
-        return latest_pipe, meta_path
+            if not (name.startswith("pipeline_") and name.endswith(".joblib")):
+                continue
+            path = os.path.join(art_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                mtime = 0.0
+            stem = os.path.splitext(name)[0].replace("pipeline_", "", 1)
+            meta_path = os.path.join(art_dir, f"meta_{stem}.json")
+            if not os.path.exists(meta_path):
+                meta_path = None
+            candidates.append((mtime, path, meta_path))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [(path, meta_path) for _, path, meta_path in candidates]
     except Exception:
-        return None, None
+        return []
+
+def _find_latest_artifacts():
+    candidates = _artifact_candidates()
+    return candidates[0] if candidates else (None, None)
 
 
 class LoadedPipelineAdapter:
@@ -106,6 +348,22 @@ class LoadedPipelineAdapter:
                 pass
             Xtr = self.preprocessor.transform(X)
         return self.model.predict(Xtr)
+
+
+def _coerce_pipeline_object(obj):
+    if isinstance(obj, dict) and "preprocessor" in obj and "model" in obj:
+        return LoadedPipelineAdapter(obj["preprocessor"], obj["model"])
+    try:
+        from sklearn.pipeline import Pipeline as SkPipeline  # type: ignore
+
+        if isinstance(obj, SkPipeline) and hasattr(obj, "named_steps"):
+            pre = obj.named_steps.get("preprocessor")
+            mdl = obj.named_steps.get("model", obj)
+            if pre is not None and mdl is not None:
+                return LoadedPipelineAdapter(pre, mdl)
+    except Exception:
+        pass
+    return obj
 
 
 def _expected_columns_from_preprocessor(preproc) -> set:
@@ -155,12 +413,12 @@ def _get_frequent_levels_from_preprocessor(preproc) -> dict:
 
 def _ensure_heavy_tail_logs(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for base in ("Capital Value", "Land Value", "Days on Market"):
+    for base in ALLOWED_LOG_FEATURES:
         if base in out.columns and f"log_{base}" not in out.columns:
             out[f"log_{base}"] = np.log1p(
                 pd.to_numeric(out[base], errors="coerce").clip(lower=0)
             )
-    return out
+    return _apply_feature_policy(out, drop_geo=False)
 
 
 def _engineer_features_serve(df: pd.DataFrame) -> pd.DataFrame:
@@ -214,70 +472,32 @@ def _engineer_features_serve(df: pd.DataFrame) -> pd.DataFrame:
 
 def _geo_kwargs_from_metadata(metadata: dict) -> Dict[str, object] | None:
     geo_meta = (metadata or {}).get("geo") or {}
-    poi_csv = geo_meta.get("poi_csv") or os.getenv("GEO_POI_CSV")
-    if not poi_csv:
+    poi_csv = geo_meta.get("poi_csv") or os.getenv("GEO_POI_CSV") or "artifacts/poi_christchurch.csv"
+    if poi_csv and not os.path.exists(poi_csv):
+        alt = Path(os.getenv("MODEL_DIR", "artifacts")).joinpath(Path(poi_csv).name)
+        if alt.exists():
+            poi_csv = str(alt)
+    if not poi_csv or not os.path.exists(poi_csv):
+        logging.warning("Geo metadata missing POI CSV; skipping geo feature augmentation")
         return None
 
-    def _parse_float_tuple(
-        val, default_str: str, default_tuple: Tuple[float, ...]
-    ) -> Tuple[float, ...]:
-        if val is None:
-            val = (
-                os.getenv(default_str)
-                if default_tuple is None
-                else os.getenv(default_str)
-            )
-        if val is None:
-            return default_tuple
-        if isinstance(val, (list, tuple)):
-            try:
-                vals = tuple(float(x) for x in val)
-                return vals if vals else default_tuple
-            except Exception:
-                return default_tuple
-        if isinstance(val, str):
-            tokens = [t for t in re.split(r"[;,\s]+", val) if t]
-            try:
-                vals = tuple(float(t) for t in tokens)
-                return vals if vals else default_tuple
-            except Exception:
-                return default_tuple
-        return default_tuple
-
-    default_radii = tuple(
-        float(x)
-        for x in os.getenv("GEO_RADII_KM", "0.5,1.0,2.0").split(",")
-        if x.strip()
-    )
-    radii = _parse_float_tuple(geo_meta.get("radii_km"), "GEO_RADII_KM", default_radii)
-
-    def _parse_float(val, env_name: str, fallback: float) -> float:
-        if val is not None:
-            try:
-                return float(val)
-            except Exception:
-                pass
-        try:
-            return float(os.getenv(env_name, fallback))
-        except Exception:
-            return fallback
-
-    decay_km = _parse_float(geo_meta.get("decay_km"), "GEO_DECAY_KM", 1.5)
-    max_decay_km = _parse_float(geo_meta.get("max_decay_km"), "GEO_MAX_DECAY_KM", 3.0)
+    radii = geo_meta.get("radii_km") or os.getenv("GEO_RADII_KM") or "0.5,1.0,2.0"
+    if isinstance(radii, str):
+        radii = [float(x.strip()) for x in radii.split(",") if x.strip()]
+    include_bearings = geo_meta.get("include_bearings")
+    if include_bearings is None:
+        include_bearings = GEO_INCLUDE_BEARINGS
+    use_accessibility = geo_meta.get("use_accessibility")
+    if use_accessibility is None:
+        use_accessibility = GEO_USE_ACCESSIBILITY
+    school_mode = geo_meta.get("school_mode") or GEO_SCHOOL_FEATURE or "dist_min"
 
     categories = geo_meta.get("categories")
-    if categories is None:
-        env_cat = os.getenv("GEO_CATEGORIES")
-        if env_cat:
-            categories = [
-                c.strip().upper().replace(" ", "_")
-                for c in re.split(r"[;,]+", env_cat)
-                if c.strip()
-            ]
-    elif isinstance(categories, str):
+    if isinstance(categories, str):
         categories = [
             c.strip().upper().replace(" ", "_")
-            for c in re.split(r"[;,]+", categories)
+            for part in categories.split(",")
+            for c in part.split(" ")
             if c.strip()
         ]
     elif isinstance(categories, (list, tuple)):
@@ -293,9 +513,13 @@ def _geo_kwargs_from_metadata(metadata: dict) -> Dict[str, object] | None:
         "lat_col": lat_col,
         "lon_col": lon_col,
         "categories": tuple(categories) if categories else None,
-        "radii_km": tuple(radii),
-        "decay_km": decay_km,
-        "max_decay_km": max_decay_km,
+        "radii_km": tuple(float(r) for r in radii),
+        "decay_km": geo_meta.get("decay_km") or float(os.getenv("GEO_DECAY_KM", 1.5)),
+        "max_decay_km": geo_meta.get("max_decay_km")
+        or float(os.getenv("GEO_MAX_DECAY_KM", 3.0)),
+        "include_bearings": bool(include_bearings),
+        "use_accessibility": bool(use_accessibility),
+        "school_mode": school_mode,
     }
 
 
@@ -313,6 +537,9 @@ def _maybe_add_geo_serve(df: pd.DataFrame, metadata: dict) -> pd.DataFrame:
             radii_km=cfg["radii_km"],
             decay_km=cfg["decay_km"],
             max_decay_km=cfg["max_decay_km"],
+            include_bearings=cfg.get("include_bearings"),
+            use_accessibility=cfg.get("use_accessibility"),
+            school_mode=cfg.get("school_mode"),
         )
     except Exception:
         pass
@@ -330,11 +557,13 @@ def _prepare_features_for_model(
     Returns: (prepared_features, expected_cols, missing_before, categorical_features)
     """
     work = features.copy()
+    work = _apply_feature_policy(work, drop_geo=False)
     try:
         if assign_geo_queries is not None:
             work = assign_geo_queries(work)
         if enrich_with_geocodes is not None:
             work = enrich_with_geocodes(work)
+        work = _geocode_missing_latlon(work)
     except Exception:
         pass
     # Ensure date type
@@ -346,7 +575,9 @@ def _prepare_features_for_model(
     # Pre-derive logs and engineered features BEFORE expected column check
     work = _ensure_heavy_tail_logs(work)
     work = _engineer_features_serve(work)
+    work = _apply_feature_policy(work, drop_geo=False)
     work = _maybe_add_geo_serve(work, metadata)
+    work = _apply_feature_policy(work)
 
     # Categorical lists from metadata or inference
     categorical_features = (
@@ -717,6 +948,10 @@ def _prepare_features_for_model(
 def _normalize_aliases(df: pd.DataFrame, expected: set) -> pd.DataFrame:
     """Map common alias columns to the names expected by training."""
     out = df.copy()
+    if "Furnishings" in out.columns:
+        out["Furnishings"] = out["Furnishings"].apply(_canonicalize_furnishings)
+    if "Pets" in out.columns:
+        out["Pets"] = out["Pets"].apply(_canonicalize_pets)
     alias_pairs = [
         ("Land Size (sqm)", "Land Size (m²)"),
         ("Floor Size (sqm)", "Floor Size (m²)"),
@@ -864,64 +1099,70 @@ def _compute_rank30d12m_global(
 
 
 def load_full_pipeline_and_metadata():
-    try:
-        # Prefer latest artifacts from training; fallback to models/
-        latest_pipe, latest_meta = _find_latest_artifacts()
-        if latest_pipe is not None:
-            full_pipeline_path = latest_pipe
-            metadata_path = latest_meta or os.path.join(
-                MODEL_DIR, "model_metadata.json"
-            )
-        else:
-            full_pipeline_path = os.path.join(MODEL_DIR, "full_pipeline.joblib")
-            metadata_path = os.path.join(MODEL_DIR, "model_metadata.json")
+    errors: List[Tuple[str, Exception, str]] = []
+    candidates = _artifact_candidates()
+    default_candidate = (
+        os.path.join(MODEL_DIR, "full_pipeline.joblib"),
+        os.path.join(MODEL_DIR, "model_metadata.json"),
+    )
+    if default_candidate not in candidates:
+        candidates.append(default_candidate)
 
-        # Check if files exist
-        if not os.path.exists(full_pipeline_path):
-            logging.error(f"Full pipeline file not found at: {full_pipeline_path}")
-            sys.exit(1)
-        if not os.path.exists(metadata_path):
-            logging.error(f"Metadata file not found at: {metadata_path}")
-            sys.exit(1)
-
-        # Load the full pipeline (dict or sklearn Pipeline)
-        obj = joblib.load(full_pipeline_path)
-        if isinstance(obj, dict) and "preprocessor" in obj and "model" in obj:
-            full_pipeline = LoadedPipelineAdapter(obj["preprocessor"], obj["model"])
-        else:
-            # If it's a sklearn Pipeline, extract fitted steps for stable serve-time predict
-            try:
-                from sklearn.pipeline import Pipeline as SkPipeline  # type: ignore
-
-                if isinstance(obj, SkPipeline) and hasattr(obj, "named_steps"):
-                    pre = obj.named_steps.get("preprocessor")
-                    mdl = obj.named_steps.get("model", obj)
-                    if pre is not None and mdl is not None:
-                        full_pipeline = LoadedPipelineAdapter(pre, mdl)
-                    else:
-                        full_pipeline = obj
-                else:
-                    full_pipeline = obj
-            except Exception:
-                full_pipeline = obj
-        logging.info(f"Full pipeline loaded successfully from '{full_pipeline_path}'.")
-
-        # Load the metadata if available
-        metadata = {}
-        if os.path.exists(metadata_path):
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-            logging.info(f"Metadata loaded successfully from '{metadata_path}'.")
-        else:
+    for pipeline_path, meta_hint in candidates:
+        if not pipeline_path or not os.path.exists(pipeline_path):
+            continue
+        try:
+            obj = joblib.load(pipeline_path)
+            full_pipeline = _coerce_pipeline_object(obj)
+        except Exception as exc:
+            errors.append((pipeline_path, exc, traceback.format_exc()))
             logging.warning(
-                f"Metadata file not found at: {metadata_path} — proceeding without it."
+                "Failed to load pipeline candidate '%s': %s", pipeline_path, exc
+            )
+            continue
+
+        logging.info("Full pipeline loaded successfully from '%s'.", pipeline_path)
+
+        metadata: Dict[str, object] = {}
+        meta_candidates: List[str] = []
+        if meta_hint:
+            meta_candidates.append(meta_hint)
+        fallback_meta = os.path.join(MODEL_DIR, "model_metadata.json")
+        if fallback_meta not in meta_candidates:
+            meta_candidates.append(fallback_meta)
+
+        loaded_meta_path = None
+        for meta_path in meta_candidates:
+            if meta_path and os.path.exists(meta_path):
+                with open(meta_path, "r") as f:
+                    metadata = json.load(f)
+                logging.info(
+                    "Metadata loaded successfully from '%s'.", meta_path
+                )
+                loaded_meta_path = meta_path
+                break
+
+        if loaded_meta_path is None:
+            logging.warning(
+                "Metadata file not found for pipeline '%s'; proceeding without metadata.",
+                pipeline_path,
             )
 
         return full_pipeline, metadata
-    except Exception as e:
-        logging.error(f"Error loading full pipeline and metadata: {str(e)}")
-        logging.error(traceback.format_exc())
-        sys.exit(1)
+
+    if not candidates:
+        logging.error(
+            "No pipeline artifacts available in artifacts/ or models/ directories."
+        )
+
+    for path, exc, tb in errors:
+        logging.error("Attempt to load pipeline '%s' failed: %s", path, exc)
+        logging.debug(tb)
+
+    logging.error(
+        "Error loading full pipeline and metadata: no valid pipeline artifacts found."
+    )
+    sys.exit(1)
 
 
 _QPIPE_CACHE: Dict[str, Dict[float, LoadedPipelineAdapter]] = {}
@@ -965,13 +1206,17 @@ def calculate_vwap(data, bed_type, last_rental_date):
 
         if bed_data.empty:
             logging.warning(
-                f"No historical data available for VWAP calculation for Bed='{bed_type}' before {last_rental_date.date()}."
+                f"No historical data available for VWAP calculation for Bed='{bed_type}' before {last_rental_date.date()}. Falling back to all beds."
             )
-            return None, None
+            fallback = data[data["Last Rental Date"] < last_rental_date].copy()
+            if fallback.empty:
+                logging.error("No historical rental data available to compute VWAP.")
+                return None, None
+            bed_data = fallback
 
         # Log the number of records
         logging.info(
-            f"Number of historical records for Bed='{bed_type}': {len(bed_data)}"
+            f"Number of historical records for Bed='{bed_type}' (after fallback handling): {len(bed_data)}"
         )
 
         # Calculate VWAP_3M
@@ -980,7 +1225,7 @@ def calculate_vwap(data, bed_type, last_rental_date):
         if len(vw_data_3M) >= 5:
             VWAP_3M = vw_data_3M["Last Rental Price"].mean()
         else:
-            VWAP_3M = bed_data["Last Rental Price"].mean()  # Fallback to all data
+            VWAP_3M = bed_data["Last Rental Price"].mean()  # Fallback to all available data
 
         # Calculate VWAP_12M
         start_date_12M = last_rental_date - pd.DateOffset(months=12)
@@ -988,7 +1233,7 @@ def calculate_vwap(data, bed_type, last_rental_date):
         if len(vw_data_12M) >= 20:
             VWAP_12M = vw_data_12M["Last Rental Price"].mean()
         else:
-            VWAP_12M = bed_data["Last Rental Price"].mean()  # Fallback to all data
+            VWAP_12M = bed_data["Last Rental Price"].mean()  # Fallback to all available data
 
         return VWAP_3M, VWAP_12M
 
@@ -1174,6 +1419,7 @@ def predict_with_interval(
         lo = hi = None
     return point, lo, hi
 
+
 # --- NEW: vectorized batch inference with PIs ---
 def predict_many(
     features: pd.DataFrame,
@@ -1186,7 +1432,9 @@ def predict_many(
     Vectorized scoring for a DataFrame.
     Returns a DataFrame with columns: point[, lo, hi] aligned to `features.index`.
     """
-    prepared, _, _, _ = _prepare_features_for_model(features, full_pipeline, metadata, historical_data)
+    prepared, _, _, _ = _prepare_features_for_model(
+        features, full_pipeline, metadata, historical_data
+    )
     point = np.asarray(full_pipeline.predict(prepared)).reshape(-1)
     out = pd.DataFrame({"point": point}, index=features.index)
     if not return_intervals:
@@ -1463,8 +1711,15 @@ def main():
             dest="property_type",
             help="Property Type (string)",
         )
+        parser.add_argument(
+            "--category",
+            type=str,
+            dest="category",
+            help="Category (string)",
+        )
         parser.add_argument("--agency", type=str, dest="agency", help="Agency (string)")
         parser.add_argument("--agent", type=str, dest="agent", help="Agent (string)")
+        parser.add_argument("--city", type=str, dest="city", help="City (string)")
         parser.add_argument(
             "--postcode", type=str, dest="postcode", help="Postcode (string)"
         )
@@ -1483,6 +1738,40 @@ def main():
         parser.add_argument(
             "--land-value", type=float, dest="land_value", help="Land Value (number)"
         )
+        parser.add_argument(
+            "--improvement-value",
+            type=float,
+            dest="improvement_value",
+            help="Improvement Value (number)",
+        )
+        parser.add_argument(
+            "--garage-parks",
+            type=float,
+            dest="garage_parks",
+            help="Garage Parks (number)",
+        )
+        parser.add_argument(
+            "--offstreet-parks",
+            type=float,
+            dest="offstreet_parks",
+            help="Offstreet Parks (number)",
+        )
+        parser.add_argument("--garage", type=str, dest="garage", help="Garage (string)")
+        parser.add_argument(
+            "--furnishings",
+            type=str,
+            dest="furnishings",
+            help="Furnishings (string)",
+        )
+        parser.add_argument(
+            "--furnishings-evidence",
+            type=str,
+            dest="furnishings_evidence",
+            help="Furnishings evidence (string)",
+        )
+        parser.add_argument("--pets", type=str, dest="pets", help="Pets policy (string)")
+        parser.add_argument("--latitude", type=float, dest="latitude", help="Latitude override")
+        parser.add_argument("--longitude", type=float, dest="longitude", help="Longitude override")
         parser.add_argument(
             "--valuation-date",
             type=str,
@@ -1528,7 +1817,7 @@ def main():
         args, _ = parser.parse_known_args()
         if getattr(args, "_help", False):
             print(
-                "Usage: py prediction.py [--capital-value <number>] [--land-value <number>] [--street-address ...] [--suburb ...] [--property-type ...] [--agency ...] [--agent ...] [--postcode ...] [--land-use ...] [--dev-zone ...] [--valuation-date YYYY-MM-DD] [--bed '3'] [--bath 2] [--car 1] [--land-sqm 450] [--floor-sqm 160] [--year-built 2015] [--dom 7] [--last-date YYYY-MM-DD] [--strict-schema] [--schema-threshold 0.2]"
+                "Usage: py prediction.py [--capital-value <number>] [--land-value <number>] [--improvement-value <number>] [--street-address ...] [--suburb ...] [--city ...] [--property-type ...] [--category ...] [--agency ...] [--agent ...] [--postcode ...] [--land-use ...] [--dev-zone ...] [--furnishings ...] [--garage ...] [--pets ...] [--valuation-date YYYY-MM-DD] [--bed '3'] [--bath 2] [--car 1] [--land-sqm 450] [--floor-sqm 160] [--year-built 2015] [--dom 7] [--last-date YYYY-MM-DD] [--latitude -43.5] [--longitude 172.6] [--strict-schema] [--schema-threshold 0.2]"
             )
             return
         # Load the full pipeline and metadata
@@ -1569,38 +1858,67 @@ def main():
 
         # Define base features
         base_features = {
-            "Bed": args.bed or "4",
+            "Bed": args.bed or "3",
             "Bath": args.bath if args.bath is not None else 1,
             "Car": args.car if args.car is not None else 2,
             "Land Size (sqm)": args.land_sqm if args.land_sqm is not None else 769,
+            "land_size": args.land_sqm if args.land_sqm is not None else 769,
             "Floor Size (sqm)": args.floor_sqm if args.floor_sqm is not None else 140,
+            "floor_size": args.floor_sqm if args.floor_sqm is not None else 140,
             "Year Built": args.year_built if args.year_built is not None else 1940,
             "Days on Market": args.days_on_market
             if args.days_on_market is not None
             else 6,
             "Suburb": args.suburb or "BURWOOD, CHRISTCHURCH",
-            "Property Type": args.property_type or "Residential: Ownership home units",
-            "Agency": args.agency or "Grenadier Rent Shop Ltd",
-            "Agent": args.agent or "Harcourts City Christchurch",
-            "Postcode": args.postcode or 8083,
-            "Street Address": args.street_address or "35 DUNLOPS CRESCENT",
-            "Land Use": args.land_use or "Single Unit excluding Bach",
-            "Development Zone": args.dev_zone or "Residential Zone A",
+            "city": args.city or "Christchurch",
+            "property_type2": args.property_type,
+            "category": args.category,
+            "agency": args.agency,
+            "agent": args.agent,
+            "postcode": args.postcode or "8083",
+            "Street Address": args.street_address or "9 Achilles Street",
+            "land_use": args.land_use,
+            "development_zone": args.dev_zone,
+            "garage": _canonicalize_garage(args.garage),
+            "Garage": _canonicalize_garage(args.garage),
+            "garage_parks": args.garage_parks,
+            "offstreet_parks": args.offstreet_parks,
+            "furnishings": _canonicalize_furnishings(args.furnishings),
+            "Furnishings": _canonicalize_furnishings(args.furnishings),
+            "furnishings_evidence": args.furnishings_evidence,
+            "pets": _canonicalize_pets(args.pets),
+            "Pets": _canonicalize_pets(args.pets),
             "Owner Type": "Rented",
             "Active Listing": "No",
             "Land Value": args.land_value if args.land_value is not None else 375000,
+            "Improvement Value": args.improvement_value,
+            "Latitude": args.latitude,
+            "Longitude": args.longitude,
             "Capital Value": 615000,  # Will be set in loop
             "Valuation Date": pd.to_datetime(args.valuation_date)
             if args.valuation_date
             else "1-Aug-22",
             "Last Rental Date": pd.to_datetime(args.last_date)
             if args.last_date
-            else pd.to_datetime("2025-03-18"),
+            else pd.to_datetime("2025-08-18"),
             "VWAP_3M": None,
             "VWAP_12M": None,
             "Percentage_Diff": None,
         }
+        # Provide canonical aliases expected by training normalization
+        base_features["Agency"] = base_features.get("agency")
+        base_features["Agent"] = base_features.get("agent")
+        base_features["Property Type"] = args.property_type
+        base_features["Land Use"] = base_features.get("land_use")
+        base_features["Development Zone"] = base_features.get("development_zone")
+        base_features["City"] = base_features.get("city")
 
+        base_features["Agency"] = base_features.get("agency")
+        base_features["Agent"] = base_features.get("agent")
+        base_features["Property Type"] = args.property_type
+        base_features["Land Use"] = base_features.get("land_use")
+        base_features["Development Zone"] = base_features.get("development_zone")
+        base_features["City"] = base_features.get("city")
         # Get dynamic VWAP values
         VWAP_3M, VWAP_12M = calculate_vwap(
             historical_data,
@@ -1695,8 +2013,10 @@ def _normalize_aliases2(df: pd.DataFrame, expected: set) -> pd.DataFrame:
         "postcode": "Postcode",
         "post_code": "Postcode",
         "postal_code": "Postcode",
+        "land_size": "Land Size (sqm)",
         "land_size (m²)": "Land Size (sqm)",
         "land_size (m2)": "Land Size (sqm)",
+        "floor_size": "Floor Size (sqm)",
         "floor_size (m²)": "Floor Size (sqm)",
         "floor_size (m2)": "Floor Size (sqm)",
         "year_built": "Year Built",
@@ -1709,6 +2029,8 @@ def _normalize_aliases2(df: pd.DataFrame, expected: set) -> pd.DataFrame:
         "valuation_date": "Valuation Date",
         "furnishingsF": "Furnishings",
         "furnishings": "Furnishings",
+        "pets": "Pets",
+        "garage": "garage",
     }
     for a, b in alias_pairs:
         if a in expected and a not in out.columns and b in out.columns:
@@ -1744,6 +2066,35 @@ def _normalize_aliases2(df: pd.DataFrame, expected: set) -> pd.DataFrame:
             )
         elif hasattr(comp, "__len__"):
             out["Car"] = comp
+    # Ensure compatibility for snake_case size columns
+    if "Land Size (sqm)" in out.columns:
+        out["land_size"] = out["Land Size (sqm)"]
+    elif "land_size" in out.columns and "Land Size (sqm)" in expected:
+        out["Land Size (sqm)"] = out["land_size"]
+    if "Floor Size (sqm)" in out.columns:
+        out["floor_size"] = out["Floor Size (sqm)"]
+    elif "floor_size" in out.columns and "Floor Size (sqm)" in expected:
+        out["Floor Size (sqm)"] = out["floor_size"]
+    # Canonicalize Furnishings/Pets/Garage values
+    if "Furnishings" in out.columns:
+        out["Furnishings"] = out["Furnishings"].apply(_canonicalize_furnishings)
+    if "furnishings" in out.columns:
+        out["furnishings"] = out["furnishings"].apply(_canonicalize_furnishings)
+        if "Furnishings" not in out.columns:
+            out["Furnishings"] = out["furnishings"]
+    if "Pets" in out.columns:
+        out["Pets"] = out["Pets"].apply(_canonicalize_pets)
+    if "pets" in out.columns:
+        out["pets"] = out["pets"].apply(_canonicalize_pets)
+        if "Pets" not in out.columns:
+            out["Pets"] = out["pets"]
+    if "Garage" in out.columns:
+        out["Garage"] = out["Garage"].apply(_canonicalize_garage)
+    if "garage" in out.columns:
+        out["garage"] = out["garage"].apply(_canonicalize_garage)
+        if "Garage" not in out.columns:
+            out["Garage"] = out["garage"]
+
     if "Postcode" in out.columns:
         out["Postcode"] = (
             pd.to_numeric(out["Postcode"], errors="coerce")
@@ -1756,3 +2107,6 @@ def _normalize_aliases2(df: pd.DataFrame, expected: set) -> pd.DataFrame:
 
 if __name__ == "__main__":
     main()
+
+
+

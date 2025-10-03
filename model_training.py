@@ -56,6 +56,79 @@ import warnings
 import re
 import math
 
+import log_policy
+
+# ────────────────────── Log feature helpers ────────────────────── #
+
+ALLOWED_LOG_FEATURES = log_policy.ALLOWED_LOG_FEATURES
+_enforce_log_feature_policy = log_policy._enforce_log_feature_policy
+UNWANTED_FEATURES = {
+    "Month",
+    "Month_sin",
+    "Month_cos",
+    "has_car",
+    "has_two_car",
+    "has_three_plus_car",
+    "is_newer_2010",
+}
+GEO_COLUMNS = {"Latitude", "Longitude"}
+
+def _excluded_numeric_features() -> set[str]:
+    raw = os.getenv("EXCLUDE_NUM_FEATURES", "")
+    if not raw:
+        return set()
+    return {c.strip() for c in re.split(r"[;,]", raw) if c.strip()}
+
+def _filtered_numeric_columns(cols: list[str]) -> list[str]:
+    excluded = _excluded_numeric_features()
+    if not excluded:
+        return cols
+    return [c for c in cols if c not in excluded]
+
+def _apply_distance_clip(df: pd.DataFrame) -> pd.DataFrame:
+    clip_km = float(os.getenv("GEO_CLIP_DIST_KM", "0") or 0)
+    if clip_km > 0:
+        for col in [c for c in df.columns if re.match(r"^dist_.*_km$", str(c))]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").clip(upper=clip_km)
+    return df
+
+def _apply_feature_policy(df: pd.DataFrame, *, drop_geo: bool = True) -> pd.DataFrame:
+    """Apply shared log policy, clip geo distances, and remove unwanted/raw geo features."""
+    df = log_policy.apply_log_policy(df, drop_raw=True)
+    df = _apply_distance_clip(df)
+    drop = [c for c in UNWANTED_FEATURES if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop, errors="ignore")
+    if drop_geo:
+        geo_drop = [c for c in GEO_COLUMNS if c in df.columns]
+        if geo_drop:
+            df = df.drop(columns=geo_drop, errors="ignore")
+    return df
+
+def _mono_from_env(numeric_cols: list[str]) -> list[int] | None:
+    """Resolve monotone constraints from env, with sensible defaults.
+
+    - MONO_INC/MONO_DEC can list feature names (comma/semicolon separated)
+    - If neither provided but ENFORCE_MONOTONE is enabled, default to
+      increasing for a small whitelist: Bath, Car, Floor Size (sqm),
+      log_Floor Size (sqm) when present in numeric_cols.
+    """
+    inc = {s.strip() for s in re.split(r"[;,]", os.getenv("MONO_INC", "")) if s.strip()}
+    dec = {s.strip() for s in re.split(r"[;,]", os.getenv("MONO_DEC", "")) if s.strip()}
+    if not inc and not dec and ENFORCE_MONOTONE:
+        # Built-in safe defaults
+        inc = {"Bath", "Car", "Floor Size (sqm)", "log_Floor Size (sqm)"}
+    if not inc and not dec:
+        return None
+    out: list[int] = []
+    for col in numeric_cols:
+        if col in inc:
+            out.append(1)
+        elif col in dec:
+            out.append(-1)
+        else:
+            out.append(0)
+    return out if any(v != 0 for v in out) else None
 # ────────────────────── Global settings & exports ────────────────────── #
 
 RANDOM_STATE = 42
@@ -100,6 +173,19 @@ MEDIAN_BLEND_LAMBDA_MAX = float(os.getenv("MEDIAN_BLEND_LAMBDA_MAX", "0.35"))
 ENABLE_RESIDUAL_BOOSTER = os.getenv("ENABLE_RESIDUAL_BOOSTER", "0").lower() in {"1","true","yes"}
 TEACHER_PIPELINE = os.getenv("TEACHER_PIPELINE", "").strip()
 GEO_POI_CSV = os.getenv("GEO_POI_CSV", "").strip()
+GEO_INCLUDE_BEARINGS = os.getenv("GEO_INCLUDE_BEARINGS", "0").lower() in {
+    "1", "true", "yes"
+}
+GEO_USE_ACCESSIBILITY = os.getenv("GEO_USE_ACCESSIBILITY", "0").lower() in {
+    "1", "true", "yes"
+}
+_GEO_SCHOOL_MODE_RAW = (
+    (os.getenv("GEO_SCHOOL_FEATURE", "dist_min") or "dist_min").strip().lower()
+)
+_GEO_SCHOOL_MODES = {"dist_min", "primary", "intermediate", "high"}
+GEO_SCHOOL_FEATURE = (
+    _GEO_SCHOOL_MODE_RAW if _GEO_SCHOOL_MODE_RAW in _GEO_SCHOOL_MODES else "dist_min"
+)
 ADV_AUC_WARN = float(os.getenv("ADV_AUC_WARN", "0.75"))
 # NEW: domain-importance weighting (covariate-shift mitigation)
 ENABLE_IMPORTANCE_WEIGHTED_FIT = os.getenv("ENABLE_IMPORTANCE_WEIGHTED_FIT", "1").lower() in {"1","true","yes"}
@@ -558,6 +644,15 @@ def _geo_env_config() -> dict[str, Any] | None:
     except Exception:
         max_decay_km = 3.0
     categories = _parse_geo_categories(cats_env)
+    cat_list: list[str] = []
+    if categories:
+        cat_list.extend(categories)
+    school_required = ["SCHOOL_HIGH", "SCHOOL_PRIMARY", "SCHOOL_INTERMEDIATE"]
+    poi_required = ["UNIVERSITY"]
+    for cat in poi_required + school_required:
+        if cat not in cat_list:
+            cat_list.append(cat)
+    categories = tuple(cat_list) if cat_list else tuple(poi_required + school_required)
     return {
         "poi_csv": poi_csv,
         "lat_col": lat_col,
@@ -566,6 +661,9 @@ def _geo_env_config() -> dict[str, Any] | None:
         "decay_km": decay_km,
         "max_decay_km": max_decay_km,
         "categories": categories,
+        "include_bearings": GEO_INCLUDE_BEARINGS,
+        "use_accessibility": GEO_USE_ACCESSIBILITY,
+        "school_mode": GEO_SCHOOL_FEATURE,
     }
 
 
@@ -766,11 +864,12 @@ class RobustWinsorizer(BaseEstimator, TransformerMixin):
         self.bounds_.clear()
         for col in X_df.columns:
             s = pd.to_numeric(X_df[col], errors="coerce").astype("Float64")
-            if s.notna().any():
-                lo = float(np.nanquantile(s, self.lower_q))
-                hi = float(np.nanquantile(s, self.upper_q))
-            else:
+            arr = s.to_numpy(dtype=np.float64, na_value=np.nan)
+            if np.isnan(arr).all():
                 lo, hi = (np.nan, np.nan)
+            else:
+                lo = float(np.nanquantile(arr, self.lower_q))
+                hi = float(np.nanquantile(arr, self.upper_q))
             self.bounds_[str(col)] = (lo, hi)
         return self
 
@@ -989,6 +1088,8 @@ def make_time_features(
     work = df.copy()
     if work.empty or fit_idx.size == 0:
         return work
+    if suburb_col not in work.columns or date_col not in work.columns or target_col not in work.columns:
+        return work
     if not USE_SUBURB_FEATURES:
         return work
     # rolling 90-day median of target using TRAIN rows only
@@ -1017,6 +1118,8 @@ def make_time_features(
         .rename("Suburb90dMedian")
         .reset_index()
     )
+    if suburb_col not in med90.columns or date_col not in med90.columns:
+        return work
     med90 = med90.drop_duplicates(subset=[suburb_col, date_col], keep="last")
     if USE_SUBURB_MEDIANS:
         work = work.merge(med90, on=[suburb_col, date_col], how="left")
@@ -1157,6 +1260,40 @@ def build_preprocessor(
     return preproc, cat_idx
 
 
+
+def _clip_cat_indices(cat_idx: List[int], n_features: int) -> List[int]:
+    clipped = [idx for idx in cat_idx if 0 <= idx < n_features]
+    if len(clipped) != len(cat_idx):
+        logging.warning("Adjusted cat feature indices from %s to %s (n_features=%d)", cat_idx, clipped, n_features)
+    return clipped
+
+
+def _expand_cat_indices_for_strings(X: np.ndarray, cat_idx: List[int]) -> List[int]:
+    try:
+        if not isinstance(X, np.ndarray) or X.size == 0:
+            return cat_idx
+    except Exception:
+        return cat_idx
+    new_idx = set(cat_idx)
+    try:
+        if X.dtype.kind in {"O", "U", "S"}:
+            rows = min(32, X.shape[0])
+            for j in range(X.shape[1]):
+                if j in new_idx:
+                    continue
+                column = X[:rows, j]
+                for val in column:
+                    if isinstance(val, str) and val != "":
+                        new_idx.add(j)
+                        break
+    except Exception:
+        return cat_idx
+    expanded = sorted(new_idx)
+    if expanded != sorted(cat_idx):
+        logging.warning("Expanded cat feature indices from %s to %s based on detected string columns", cat_idx, expanded)
+    return expanded
+
+
 # ───────────────────────────── CV helpers ───────────────────────────── #
 
 def make_block_labels(dates: pd.Series, freq: str = "M") -> np.ndarray:
@@ -1207,6 +1344,28 @@ def split_holdout_by_months(
     )
 
 # --- NEW: optional geo enrichment hook ---
+
+
+def _infer_gap_months(
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    early_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> int:
+    if train_idx.size == 0:
+        return 0
+    hold_labels: list[int] = []
+    if early_idx.size:
+        hold_labels.append(int(np.min(labels[early_idx])))
+    if test_idx.size:
+        hold_labels.append(int(np.min(labels[test_idx])))
+    if not hold_labels:
+        return 0
+    last_train = int(np.max(labels[train_idx]))
+    first_hold = min(hold_labels)
+    return max(0, first_hold - last_train - 1)
+
+
 def _try_add_geo_features(df: pd.DataFrame) -> pd.DataFrame:
     cfg = _geo_env_config()
     if not cfg:
@@ -1322,13 +1481,25 @@ def _adversarial_auc_and_weights(X_train, X_early, X_test):
 
     Returns (auc, w_train, w_early) where weights are clipped importance weights.
     """
-    X_adv = sp.vstack([X_train, X_early, X_test]) if sp.issparse(X_train) else np.vstack([X_train, X_early, X_test])
-    n_tr, n_ea, n_te = len(X_train), len(X_early), len(X_test)
+    if len(X_test) == 0:
+        raise RuntimeError("Adversarial probe requires at least one TEST row")
+    if len(X_train) + len(X_early) == 0:
+        raise RuntimeError("Adversarial probe requires TRAIN or EARLY rows")
+    Xt = _coerce_for_adv_lr(X_train)
+    Xe = _coerce_for_adv_lr(X_early)
+    Xs = _coerce_for_adv_lr(X_test)
+    n_tr, n_ea, n_te = Xt.shape[0], Xe.shape[0], Xs.shape[0]
+    X_adv = np.vstack([Xt, Xe, Xs])
     y_adv = np.concatenate([np.zeros(n_tr + n_ea, dtype=int), np.ones(n_te, dtype=int)])
     clf = LogisticRegression(
-        solver=ADV_LOG_SOLVER, penalty="l2", C=ADV_LOG_C,
-        max_iter=ADV_LOG_MAX_ITER, tol=ADV_LOG_TOL,
-        class_weight="balanced", n_jobs=-1, fit_intercept=True,
+        solver=ADV_LOG_SOLVER,
+        penalty="l2",
+        C=ADV_LOG_C,
+        max_iter=ADV_LOG_MAX_ITER,
+        tol=ADV_LOG_TOL,
+        class_weight="balanced",
+        n_jobs=-1,
+        fit_intercept=True,
     )
     clf.fit(X_adv, y_adv)
     p_all = clf.predict_proba(X_adv)[:, 1]
@@ -1663,6 +1834,7 @@ def tune_catboost(
             df_fold = make_time_features(
                 df_full, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
             )
+            df_fold = _apply_feature_policy(df_fold)
 
             feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_checker(c)]
             num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
@@ -1695,6 +1867,7 @@ def tune_catboost(
                             num_cols_fold.pop(_idx)
             except Exception:
                 pass
+            num_cols_fold = _filtered_numeric_columns(num_cols_fold)
             # Reduce reliance on raw region IDs when robust suburb features are active
             if (DROP_REGION_IDS_IN_CV or (USE_SUBURB_FEATURES and (USE_SUBURB_MEDIANS or USE_SUBURB_LOO))):
                 cat_cols_fold = [c for c in cat_cols_fold if c not in {"Suburb", "Postcode"}]
@@ -1708,6 +1881,8 @@ def tune_catboost(
             X_va = preproc.transform(df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold])
             X_tr = np.array(X_tr, copy=False)
             X_va = np.array(X_va, copy=False)
+            cat_idx = _expand_cat_indices_for_strings(X_tr, cat_idx)
+            cat_idx = _clip_cat_indices(cat_idx, X_tr.shape[1])
 
             y_tr = df_fold.iloc[tr_idx][target_col].to_numpy()
             y_va = df_fold.iloc[val_idx][target_col].to_numpy()
@@ -1739,15 +1914,17 @@ def tune_catboost(
                 w_tr = w_tr * _recency_weights(df_fold.iloc[tr_idx][date_col], ref_dt, halflife_days)
                 w_va = w_va * _recency_weights(df_fold.iloc[val_idx][date_col], ref_dt, halflife_days)
 
-            # Optional monotonic constraints (guarded behind env flag)
+            # Optional monotonic constraints (env-driven)
             params_fold = params
-            if ENFORCE_MONOTONE:
+            mono_list = _mono_from_env(num_cols_fold)
+            if mono_list is None and ENFORCE_MONOTONE:
                 try:
-                    _mono_pos = {"Bath", "Car", "has_car", "has_two_car", "has_three_plus_car"}
-                    mono = [1 if (c in _mono_pos) else 0 for c in num_cols_fold]
-                    params_fold = {**params, "monotone_constraints": mono}
+                    _mono_pos = {"Bath", "Car"}
+                    mono_list = [1 if (c in _mono_pos) else 0 for c in num_cols_fold]
                 except Exception:
-                    params_fold = params
+                    mono_list = None
+            if mono_list is not None:
+                params_fold = {**params_fold, "monotone_constraints": mono_list}
 
             if CB_THREAD_COUNT > 0:
                 params_fold = {**params_fold, "thread_count": CB_THREAD_COUNT}
@@ -1982,6 +2159,8 @@ def train_model(
             continue
         df[f"log_{col}"] = np.log1p(df[col].clip(lower=0))
 
+    df = _apply_feature_policy(df)
+
     # Lightweight, leak-safe engineered features to improve RMSE/R²
     try:
         # Age in years
@@ -2099,6 +2278,7 @@ def train_model(
 
     # Make leak-safe time features using TRAIN history only
     df_time = make_time_features(df, train_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col)
+    df_time = _apply_feature_policy(df_time)
     if df_time.empty:
         df_time = df.copy()
     # Leak-safe momentum feature: short vs long suburb median
@@ -2159,6 +2339,9 @@ def train_model(
             if must in train_df.columns and must not in feature_cols:
                 feature_cols.append(must)
     num_all = [c for c in feature_cols if pd.api.types.is_numeric_dtype(train_df[c])]
+    excluded_numeric = _excluded_numeric_features()
+    if excluded_numeric:
+        num_all = [c for c in num_all if c not in excluded_numeric]
     # Ensure bed-normalized size kept
     if "floor_to_bed_med" in train_df.columns and "floor_to_bed_med" not in num_all:
         num_all.append("floor_to_bed_med")
@@ -2214,6 +2397,8 @@ def train_model(
                 logging.info("Always-kept geo features: %s", ", ".join(sorted(set(map(str, kept)))))
     except Exception:
         pass
+
+    num_cols = _filtered_numeric_columns(num_cols)
 
     # Prefer log versions over raw for heavy‑tailed numerics to avoid duplicate signals
     prefer_log_for = [s.strip() for s in os.getenv(
@@ -2280,6 +2465,8 @@ def train_model(
     X_train = np.array(preproc.fit_transform(train_df[num_cols + cat_cols]), copy=False)
     X_early = np.array(preproc.transform(early_df[num_cols + cat_cols]), copy=False)
     X_test = np.array(preproc.transform(test_df[num_cols + cat_cols]), copy=False)
+    cat_idx = _expand_cat_indices_for_strings(X_train, cat_idx)
+    cat_idx = _clip_cat_indices(cat_idx, X_train.shape[1])
 
     y_train = train_df[target_col].to_numpy()
     y_early = early_df[target_col].to_numpy()
@@ -2356,9 +2543,11 @@ def train_model(
                 df_fold = make_time_features(
                     df, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
                 )
+                df_fold = _apply_feature_policy(df_fold)
                 feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_check(c)]
                 num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
                 cat_cols_fold = [c for c in feat_fold if c not in num_cols_fold]
+                num_cols_fold = _filtered_numeric_columns(num_cols_fold)
 
                 preproc_fold, cat_idx_fold = build_preprocessor(
                     df_fold.iloc[tr_idx], num_cols_fold, cat_cols_fold, scale_numeric, date_col=date_col
@@ -2426,6 +2615,7 @@ def train_model(
                 df_fold = make_time_features(
                     df, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
                 )
+                df_fold = _apply_feature_policy(df_fold)
 
                 feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_check(c)]
                 num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
@@ -2442,12 +2632,16 @@ def train_model(
                     except Exception:
                         pass
 
+                num_cols_fold = _filtered_numeric_columns(num_cols_fold)
+
                 preproc_fold, cat_idx_fold = build_preprocessor(
                     df_fold.iloc[tr_idx], num_cols_fold, cat_cols_fold, scale_numeric, date_col=date_col
                 )
 
                 X_tr_f = np.array(preproc_fold.fit_transform(df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]), copy=False)
                 X_va_f = np.array(preproc_fold.transform(df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold]), copy=False)
+                cat_idx_fold = _expand_cat_indices_for_strings(X_tr_f, cat_idx_fold)
+                cat_idx_fold = _clip_cat_indices(cat_idx_fold, X_tr_f.shape[1])
                 y_tr_f = df_fold.iloc[tr_idx][target_col].to_numpy()
                 y_va_f = df_fold.iloc[val_idx][target_col].to_numpy()
 
@@ -2586,11 +2780,11 @@ def train_model(
     # otherwise use MAE for MAE/wMAE tuning or RMSE by default.
     # Final objective to monitor; training stays on log-target with RMSE
     _final_loss = "MAE" if (os.getenv("FINAL_OBJECTIVE", "").lower() == "mae" or opt_loss.lower() in {"mae","wmae"}) else "RMSE"
-    # Monotonic constraints for final fit (apply to numeric block only) – optional
-    mono_final = None
-    if ENFORCE_MONOTONE:
+    # Monotonic constraints derived from env (fallback to legacy when flag set)
+    mono_final = _mono_from_env(num_cols)
+    if mono_final is None and ENFORCE_MONOTONE:
         try:
-            _mono_pos_final = {"Bath", "Car", "has_car", "has_two_car", "has_three_plus_car"}
+            _mono_pos_final = {"Bath", "Car"}
             mono_final = [1 if (c in _mono_pos_final) else 0 for c in num_cols]
         except Exception:
             mono_final = None
@@ -2931,6 +3125,20 @@ def train_model(
         logging.warning("Feature importance failed: %s", e)
         pd.DataFrame({"feature": [], "gain": []}).to_csv(imp_path, index=False)
 
+    # Save exact model input matrices (features + target per split)
+    try:
+        feature_cols_final = list(dict.fromkeys(list(num_cols) + list(cat_cols)))
+        def _export_split(df_split: pd.DataFrame, split_name: str) -> None:
+            cols = [c for c in feature_cols_final if c in df_split.columns]
+            export_df = df_split[cols + [target_col]].copy()
+            export_df.insert(0, "__split", split_name)
+            export_df.to_csv(ARTIFACT_DIR / f"model_input_{split_name}_{ds_hash}.csv", index=False)
+        _export_split(train_df, "train")
+        _export_split(early_df, "early")
+        _export_split(test_df, "test")
+    except Exception as e:
+        logging.warning("Saving model input datasets failed: %s", e)
+
     # Save split datasets for audit
     try:
         train_df.assign(__split="train").to_csv(ARTIFACT_DIR / f"train_df_{ds_hash}.csv", index=False)
@@ -3206,3 +3414,4 @@ def cli() -> None:
 
 if __name__ == "__main__":
     cli()
+

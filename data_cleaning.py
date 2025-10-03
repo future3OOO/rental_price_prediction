@@ -23,8 +23,10 @@ _ALIAS_MAP = {
     "postcode": "Postcode",
     "post_code": "Postcode",
     "postal_code": "Postcode",
+    "land_size": "Land Size (sqm)",
     "land_size (m²)": "Land Size (sqm)",
     "land_size (m2)": "Land Size (sqm)",
+    "floor_size": "Floor Size (sqm)",
     "floor_size (m²)": "Floor Size (sqm)",
     "floor_size (m2)": "Floor Size (sqm)",
     "year_built": "Year Built",
@@ -40,7 +42,9 @@ _ALIAS_MAP = {
     "valuation_date": "Valuation Date",
     "furnishingsf": "Furnishings",
     "furnishings": "Furnishings",
+    "pets": "Pets",
     "carparks": "Car",
+    "garage": "garage",
     "car": "Car",
     "latitude": "Latitude",
     "lat": "Latitude",
@@ -50,6 +54,146 @@ _ALIAS_MAP = {
     "lng": "Longitude",
     "gps_lon": "Longitude",
 }
+
+
+
+_FURNISHINGS_CANONICAL = {
+    # Lowercase to align with training artifacts
+    "unfurnished": "unfurnished",
+    "furnished": "furnished",
+    "partially furnished": "partially furnished",
+    "partial": "partially furnished",
+    "fully furnished": "furnished",
+    "full": "furnished",
+}
+
+
+def _canonicalize_furnishings(value: object) -> str:
+    """Return lowercase categories matching training ('unfurnished'|'furnished'|'partially furnished')."""
+    if value is None:
+        return "unfurnished"
+    if isinstance(value, float) and np.isnan(value):
+        return "unfurnished"
+    text = str(value).strip()
+    if not text:
+        return "unfurnished"
+    lower = text.lower()
+    if lower in {"nill", "nil", "none", "null"}:
+        return "unfurnished"
+    if "fully" in lower and "furnish" in lower:
+        return "furnished"
+    if "partial" in lower:
+        return "partially furnished"
+    return _FURNISHINGS_CANONICAL.get(lower, lower)
+
+
+def _normalize_furnishings_column(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ("Furnishings", "furnishings") if c in df.columns]
+    if not cols:
+        return df
+    work = df.copy()
+    for col in cols:
+        work[col] = work[col].apply(_canonicalize_furnishings)
+    if "Furnishings" in cols and "furnishings" not in cols:
+        work["furnishings"] = work["Furnishings"]
+    if "furnishings" in cols and "Furnishings" not in cols:
+        work["Furnishings"] = work["furnishings"]
+    return work
+
+
+_PETS_CANONICAL = {
+    "no": "No Pets",
+    "no pets": "No Pets",
+    "not allowed": "No Pets",
+    "pets not allowed": "No Pets",
+    "pets ok": "Pets Allowed",
+    "pets allowed": "Pets Allowed",
+    "yes": "Pets Allowed",
+    "pet friendly": "Pets Allowed",
+    "pets negotiable": "Pets Negotiable",
+    "negotiable": "Pets Negotiable",
+}
+
+
+def _canonicalize_pets(value: object) -> str:
+    if value is None:
+        return "No Pets"
+    if isinstance(value, float) and np.isnan(value):
+        return "No Pets"
+    text_val = str(value).strip()
+    if not text_val:
+        return "No Pets"
+    lower = text_val.lower()
+    if lower in {"nill", "nil", "none", "null"}:
+        return "No Pets"
+    if "pets ok" in lower or "pet ok" in lower:
+        return "Pets Allowed"
+    if "allow" in lower and "pet" in lower:
+        return "Pets Allowed"
+    if "friendly" in lower and "pet" in lower:
+        return "Pets Allowed"
+    if "negotiable" in lower and "pet" in lower:
+        return "Pets Negotiable"
+    if lower in _PETS_CANONICAL:
+        return _PETS_CANONICAL[lower]
+    if lower == "ok":
+        return "Pets Allowed"
+    return text_val.title()
+
+
+def _normalize_pets_column(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ("Pets", "pets") if c in df.columns]
+    if not cols:
+        return df
+    work = df.copy()
+    for col in cols:
+        work[col] = work[col].apply(_canonicalize_pets)
+    if "Pets" in cols and "pets" not in cols:
+        work["pets"] = work["Pets"]
+    if "pets" in cols and "Pets" not in cols:
+        work["Pets"] = work["pets"]
+    return work
+
+
+_GARAGE_CANONICAL = {
+    "no": "No Garage",
+    "none": "No Garage",
+    "nil": "No Garage",
+    "n": "No Garage",
+    "0": "No Garage",
+    "yes": "Yes",
+    "y": "Yes",
+}
+
+
+def _canonicalize_garage(value: object) -> str:
+    if value is None:
+        return "No Garage"
+    if isinstance(value, float) and np.isnan(value):
+        return "No Garage"
+    text_val = str(value).strip()
+    if not text_val:
+        return "No Garage"
+    lower = text_val.lower()
+    if lower in _GARAGE_CANONICAL:
+        return _GARAGE_CANONICAL[lower]
+    if "no garage" in lower:
+        return "No Garage"
+    return text_val.title()
+
+
+def _normalize_garage_column(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ("Garage", "garage") if c in df.columns]
+    if not cols:
+        return df
+    work = df.copy()
+    for col in cols:
+        work[col] = work[col].apply(_canonicalize_garage)
+    if "Garage" in cols and "garage" not in cols:
+        work["garage"] = work["Garage"]
+    if "garage" in cols and "Garage" not in cols:
+        work["Garage"] = work["garage"]
+    return work
 
 
 def _apply_alias_mapping(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.DataFrame:
@@ -71,6 +215,9 @@ def _apply_alias_mapping(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.Data
 def _normalize_aliases_and_ranges(df_in: pd.DataFrame) -> pd.DataFrame:
     """Map flexible CSV schemas to canonical columns and apply clamps."""
     df = _apply_alias_mapping(df_in, _ALIAS_MAP)
+    df = _normalize_furnishings_column(df)
+    df = _normalize_pets_column(df)
+    df = _normalize_garage_column(df)
 
     lower_cols = {c.lower(): c for c in df.columns}
 
