@@ -1,3 +1,0 @@
-Index,Bed,mainTarget,mainZ,zCapVal,zRent,SuspiciousFeats,Land Size (sqm)_val,Land Size (sqm)_z,Floor Size (sqm)_val,Floor Size (sqm)_z,Year Built_val,Year Built_z,Capital Value_val,Capital Value_z,Last Rental Price_val,Last Rental Price_z
-8,0.0,Last Rental Price,5.319685142857143,2.615408163265306,5.319685142857143,Capital Value[z=2.62];Floor Size (sqm)[z=2.76],3025.0,1.2357091757387249,1380.0,2.7551610169491525,2000.0,0.0,2900000,2.615408163265306,176520.0,5.319685142857143
-9,0.0,Last Rental Price,5.257245714285714,3.468857142857143,5.257245714285714,Capital Value[z=3.47];Land Size (sqm)[z=2.23];Floor Size (sqm)[z=3.42],3971.0,2.2280528771384134,1612.0,3.418228813559322,2012.0,0.7358181818181818,3520000,3.468857142857143,174900.0,5.257245714285714

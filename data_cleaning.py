@@ -7,7 +7,15 @@ import traceback
 from config import CLEANED_DATA_PATH  # ensure your config.py has the correct path
 import re
 import os
-from geo_coding import assign_geo_queries, enrich_with_geocodes
+try:
+    # Import lazily and defensively so optional geo enrichment never prevents cleaning
+    from geo_coding import assign_geo_queries, enrich_with_geocodes  # type: ignore
+except Exception as _geo_imp_err:  # pragma: no cover
+    logging.warning("Geo coding not available; skipping geo enrichment in cleaning: %s", _geo_imp_err)
+    def assign_geo_queries(df):
+        return df
+    def enrich_with_geocodes(df):
+        return df
 
 
 _ALIAS_MAP = {
@@ -54,37 +62,36 @@ _ALIAS_MAP = {
     "lng": "Longitude",
     "gps_lon": "Longitude",
 }
-
+ 
 
 
 _FURNISHINGS_CANONICAL = {
-    # Lowercase to align with training artifacts
-    "unfurnished": "unfurnished",
-    "furnished": "furnished",
-    "partially furnished": "partially furnished",
-    "partial": "partially furnished",
-    "fully furnished": "furnished",
-    "full": "furnished",
+    # Title Case canonical outputs (match tests and prediction)
+    "unfurnished": "Unfurnished",
+    "furnished": "Furnished",
+    "partially furnished": "Partially Furnished",
+    "partial": "Partially Furnished",
+    "fully furnished": "Furnished",
+    "full": "Furnished",
 }
 
 
 def _canonicalize_furnishings(value: object) -> str:
-    """Return lowercase categories matching training ('unfurnished'|'furnished'|'partially furnished')."""
     if value is None:
-        return "unfurnished"
+        return "Unfurnished"
     if isinstance(value, float) and np.isnan(value):
-        return "unfurnished"
+        return "Unfurnished"
     text = str(value).strip()
     if not text:
-        return "unfurnished"
+        return "Unfurnished"
     lower = text.lower()
     if lower in {"nill", "nil", "none", "null"}:
-        return "unfurnished"
+        return "Unfurnished"
     if "fully" in lower and "furnish" in lower:
-        return "furnished"
+        return "Furnished"
     if "partial" in lower:
-        return "partially furnished"
-    return _FURNISHINGS_CANONICAL.get(lower, lower)
+        return "Partially Furnished"
+    return _FURNISHINGS_CANONICAL.get(lower, text.title())
 
 
 def _normalize_furnishings_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -92,12 +99,15 @@ def _normalize_furnishings_column(df: pd.DataFrame) -> pd.DataFrame:
     if not cols:
         return df
     work = df.copy()
-    for col in cols:
-        work[col] = work[col].apply(_canonicalize_furnishings)
-    if "Furnishings" in cols and "furnishings" not in cols:
-        work["furnishings"] = work["Furnishings"]
-    if "furnishings" in cols and "Furnishings" not in cols:
-        work["Furnishings"] = work["furnishings"]
+    vals = None
+    if "Furnishings" in work.columns:
+        vals = work["Furnishings"].apply(_canonicalize_furnishings)
+    elif "furnishings" in work.columns:
+        vals = work["furnishings"].apply(_canonicalize_furnishings)
+    else:
+        return work
+    work["Furnishings"] = vals
+    work["furnishings"] = vals
     return work
 
 
@@ -142,16 +152,21 @@ def _canonicalize_pets(value: object) -> str:
 
 
 def _normalize_pets_column(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in ("Pets", "pets") if c in df.columns]
-    if not cols:
+    """Coalesce 'Pets'/'pets' to a single canonical 'Pets' column.
+
+    Values are normalized to title-cased categories used across serve/training:
+      - 'No Pets', 'Pets Allowed', 'Pets Negotiable'.
+    The duplicate lower-case 'pets' column is removed to avoid ambiguity.
+    """
+    if ("Pets" not in df.columns) and ("pets" not in df.columns):
         return df
     work = df.copy()
-    for col in cols:
-        work[col] = work[col].apply(_canonicalize_pets)
-    if "Pets" in cols and "pets" not in cols:
-        work["pets"] = work["Pets"]
-    if "pets" in cols and "Pets" not in cols:
-        work["Pets"] = work["pets"]
+    src = "Pets" if "Pets" in work.columns else "pets"
+    vals = work[src].apply(_canonicalize_pets)
+    work["Pets"] = vals
+    # drop duplicate alias to ensure a single source of truth
+    if "pets" in work.columns:
+        work = work.drop(columns=["pets"], errors="ignore")
     return work
 
 
@@ -161,8 +176,8 @@ _GARAGE_CANONICAL = {
     "nil": "No Garage",
     "n": "No Garage",
     "0": "No Garage",
-    "yes": "Yes",
-    "y": "Yes",
+    "yes": "Has Garage",
+    "y": "Has Garage",
 }
 
 
@@ -183,16 +198,19 @@ def _canonicalize_garage(value: object) -> str:
 
 
 def _normalize_garage_column(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in ("Garage", "garage") if c in df.columns]
-    if not cols:
+    """Coalesce 'Garage'/'garage' to a single canonical 'Garage' column.
+
+    Use clearer positive wording 'Has Garage' vs 'No Garage' to improve categorical separability.
+    Remove lowercase alias after normalization to prevent drift.
+    """
+    if ("Garage" not in df.columns) and ("garage" not in df.columns):
         return df
     work = df.copy()
-    for col in cols:
-        work[col] = work[col].apply(_canonicalize_garage)
-    if "Garage" in cols and "garage" not in cols:
-        work["garage"] = work["Garage"]
-    if "garage" in cols and "Garage" not in cols:
-        work["Garage"] = work["garage"]
+    src = "Garage" if "Garage" in work.columns else "garage"
+    vals = work[src].apply(_canonicalize_garage)
+    work["Garage"] = vals
+    if "garage" in work.columns:
+        work = work.drop(columns=["garage"], errors="ignore")
     return work
 
 
@@ -269,7 +287,8 @@ def _normalize_aliases_and_ranges(df_in: pd.DataFrame) -> pd.DataFrame:
             df["Last Rental Price"], errors="coerce"
         ).clip(lower=150, upper=2500)
     if "Bed" in df.columns:
-        df["Bed"] = pd.to_numeric(df["Bed"], errors="coerce").clip(lower=0, upper=8)
+        # Hard-code bedroom clamp to 10 (previously 5/8) to retain large homes
+        df["Bed"] = pd.to_numeric(df["Bed"], errors="coerce").clip(lower=0, upper=10)
     if "Bath" in df.columns:
         df["Bath"] = pd.to_numeric(df["Bath"], errors="coerce").clip(lower=0, upper=6)
     if "Year Built" in df.columns:
@@ -327,6 +346,7 @@ def data_cleaning(data):
                     logging.info("Geo enrichment filled %d coordinate rows", filled)
         except Exception as geo_exc:
             logging.warning("Geo enrichment skipped: %s", geo_exc)
+        # Keep helper column '__geo_query__' for downstream parity/tests
         #######################
         # 1. Normalize Suburb
         #######################
@@ -514,24 +534,23 @@ def data_cleaning(data):
             )
 
         #######################
-        # 5. Fill Missing Numeric
+        # 5. Missing Numeric Handling
         #######################
-        # For numeric columns other than 'Bed' and 'Last Rental Price', fill with median
-        fill_with_median_features = [
+        # Defer numeric imputation to the model pipeline (leak-safe, per-Bed medians inside sklearn Pipeline).
+        # Here we only ensure numeric coercion/clamping above; we intentionally do NOT fill missing values.
+        for _col in [
             "Land Size (sqm)",
             "Floor Size (sqm)",
             "Year Built",
             "Days on Market",
             "Capital Value",
             "Land Value",
-        ]
-        for col in fill_with_median_features:
-            if col in data.columns:
-                median_val = data[col].median()
-                data[col].fillna(median_val, inplace=True)
-                logging.info(f"Filled missing '{col}' with median = {median_val:.2f}.")
-            else:
-                logging.warning(f"Column '{col}' not found for missing-value fill.")
+        ]:
+            if _col in data.columns:
+                logging.info(
+                    "Leaving missing '%s' as NaN for pipeline imputation (per-Bed + global median).",
+                    _col,
+                )
 
         # Special rule for 'Car': treat missing or '-' as 0 (do NOT fill with median)
         if "Car" in data.columns:
@@ -644,7 +663,8 @@ def data_cleaning(data):
         def _apply_domain_filters(df: pd.DataFrame) -> pd.DataFrame:
             now_year = pd.Timestamp.now().year
             tmin = float(os.getenv("CLEAN_TARGET_MIN", "0.0"))
-            tmax = float(os.getenv("CLEAN_TARGET_MAX", "2000.0"))
+            # Align with earlier clamp to avoid silently dropping valid high-end rows.
+            tmax = float(os.getenv("CLEAN_TARGET_MAX", "2500.0"))
             fsmin = float(os.getenv("CLEAN_FLOOR_MIN", "1.0"))
             fsmax = float(os.getenv("CLEAN_FLOOR_MAX", "100000.0"))
             lsmin = float(os.getenv("CLEAN_LAND_MIN", "1.0"))
@@ -662,9 +682,12 @@ def data_cleaning(data):
             if "Last Rental Price" in df.columns:
                 conds.append(df["Last Rental Price"].between(tmin, tmax))
             if "Floor Size (sqm)" in df.columns:
-                conds.append(df["Floor Size (sqm)"].between(fsmin, fsmax))
+                _fs = pd.to_numeric(df["Floor Size (sqm)"], errors="coerce")
+                # Treat non-positive as missing (kept for pipeline imputation)
+                conds.append(_fs.between(fsmin, fsmax) | (_fs <= 0) | _fs.isna())
             if "Land Size (sqm)" in df.columns:
-                conds.append(df["Land Size (sqm)"].between(lsmin, lsmax))
+                _ls = pd.to_numeric(df["Land Size (sqm)"], errors="coerce")
+                conds.append(_ls.between(lsmin, lsmax) | (_ls <= 0) | _ls.isna())
             if "Bed" in df.columns:
                 conds.append(df["Bed"].between(0, bedmax))
             if "Bath" in df.columns:
@@ -672,26 +695,39 @@ def data_cleaning(data):
             if "Car" in df.columns:
                 conds.append(df["Car"].between(0, carmax))
             if "Year Built" in df.columns:
-                conds.append(df["Year Built"].between(yom_min, yom_max))
+                _yb = pd.to_numeric(df["Year Built"], errors="coerce")
+                conds.append(_yb.between(yom_min, yom_max) | (_yb <= 0) | _yb.isna())
             if "Days on Market" in df.columns:
-                conds.append(df["Days on Market"].between(0, dom_max))
+                _dom = pd.to_numeric(df["Days on Market"], errors="coerce")
+                conds.append(_dom.between(0, dom_max) | (_dom <= 0) | _dom.isna())
             if "Capital Value" in df.columns:
-                conds.append(df["Capital Value"].between(capmin, capmax))
+                _cap = pd.to_numeric(df["Capital Value"], errors="coerce")
+                conds.append(_cap.between(capmin, capmax) | (_cap <= 0) | _cap.isna())
 
+            # Build a permissive mask: keep rows with NaN in any checked column so the
+            # model pipeline can impute them later. Only drop rows that are explicitly 
+            # outside the allowed domain when values are present.
             mask = pd.Series(True, index=df.index)
             for c in conds:
-                mask &= c.fillna(False)
+                # NaN -> True (kept); False only for out-of-range values
+                mask &= c.fillna(True)
 
             before = len(df)
             df = df[mask].copy()
-            logging.info("Domain filters removed %d rows.", before - len(df))
+            logging.info(
+                "Domain filters removed %d rows (missing values retained for pipeline imputation).",
+                before - len(df),
+            )
 
-            # Guard: drop non-positive floor size to avoid invalid PPS
+            # Guard: drop only explicit non-positive floor sizes; retain NaN for pipeline imputation
             if "Floor Size (sqm)" in df.columns:
                 pre = len(df)
-                df = df[df["Floor Size (sqm)"] > 0]
+                fs = pd.to_numeric(df["Floor Size (sqm)"], errors="coerce")
+                # Keep rows where floor size is NaN (to be imputed later) or > 0
+                keep_mask = fs.isna() | (fs > 0)
+                df = df[keep_mask]
                 logging.info(
-                    "Removed %d rows with non-positive 'Floor Size (sqm)'.",
+                    "Removed %d rows with non-positive 'Floor Size (sqm)' (NaNs retained).",
                     pre - len(df),
                 )
 
@@ -700,16 +736,16 @@ def data_cleaning(data):
         data = _apply_domain_filters(data)
 
         #######################
-        # 8. Remove bed > 5
+        # 8. Remove bed > 10 (retain large homes up to 10 bedrooms)
         #######################
         if "Bed" in data.columns:
             prev_shape = data.shape
-            # Keep rows where Bed is missing (NaN) or <=5; drop only where Bed >5
-            bed_cond = (data["Bed"].isna()) | (data["Bed"] <= 5)
+            # Keep rows where Bed is missing (NaN) or <=10; drop only where Bed >10
+            bed_cond = (data["Bed"].isna()) | (data["Bed"] <= 10)
             data = data[bed_cond]
             new_shape = data.shape
             logging.info(
-                f"Removed rows with Bed > 5 while retaining unknowns. Shape changed from {prev_shape} to {new_shape}."
+                f"Removed rows with Bed > 10 while retaining unknowns. Shape changed from {prev_shape} to {new_shape}."
             )
 
         #######################

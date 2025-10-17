@@ -63,6 +63,8 @@ REQUIRED_PKGS: List[str] = [
     "category_encoders",
     "scipy",        # sparse stack
     "seaborn",
+    "requests",     # geo_coding dependency (data_cleaning optional)
+    "plotly",       # plotting imports guard heavy funcs when disabled
 ]
 
 # optional local utility modules (no hard fail if absent)
@@ -281,27 +283,37 @@ def main(
         except Exception:
             cfg_lat = cfg_lon = cfg_radii = cfg_decay = cfg_maxdecay = cfg_cats = None
 
-        if not os.getenv("GEO_POI_CSV"):
+        # Hard-off: if GEO_FORCE_OFF is set, never enable Geo-POI from defaults/config
+        _geo_force_off = os.getenv("GEO_FORCE_OFF", "0").lower() in {"1", "true", "yes"}
+        if _geo_force_off:
+            # Ensure any pre-set value is cleared so downstream respects the off switch
+            if os.getenv("GEO_POI_CSV"):
+                try:
+                    del os.environ["GEO_POI_CSV"]
+                except Exception:
+                    pass
+            logging.info("Geo-POI disabled via GEO_FORCE_OFF=1; skipping auto-enable")
+        if (not os.getenv("GEO_POI_CSV")) and (not _geo_force_off):
             default_poi = ARTIFACT_DIR / "poi_christchurch.csv"
             chosen = cfg_poi if (cfg_poi and Path(cfg_poi).exists()) else (str(default_poi) if default_poi.exists() else None)
             if chosen:
                 os.environ["GEO_POI_CSV"] = str(chosen)
                 logging.info("Geo-POI enabled via config/default: %s", chosen)
         # Coordinate and geometry defaults (only if not provided via CLI/ENV)
-        if cfg_lat and not os.getenv("LAT_COL"):
+        if (not _geo_force_off) and cfg_lat and not os.getenv("LAT_COL"):
             os.environ["LAT_COL"] = str(cfg_lat)
-        if cfg_lon and not os.getenv("LON_COL"):
+        if (not _geo_force_off) and cfg_lon and not os.getenv("LON_COL"):
             os.environ["LON_COL"] = str(cfg_lon)
-        if cfg_radii and not os.getenv("GEO_RADII_KM"):
+        if (not _geo_force_off) and cfg_radii and not os.getenv("GEO_RADII_KM"):
             try:
                 os.environ["GEO_RADII_KM"] = ",".join(str(float(r)) for r in cfg_radii)
             except Exception:
                 pass
-        if cfg_decay is not None and not os.getenv("GEO_DECAY_KM"):
+        if (not _geo_force_off) and cfg_decay is not None and not os.getenv("GEO_DECAY_KM"):
             os.environ["GEO_DECAY_KM"] = str(cfg_decay)
-        if cfg_maxdecay is not None and not os.getenv("GEO_MAX_DECAY_KM"):
+        if (not _geo_force_off) and cfg_maxdecay is not None and not os.getenv("GEO_MAX_DECAY_KM"):
             os.environ["GEO_MAX_DECAY_KM"] = str(cfg_maxdecay)
-        if cfg_cats and not os.getenv("GEO_CATEGORIES"):
+        if (not _geo_force_off) and cfg_cats and not os.getenv("GEO_CATEGORIES"):
             try:
                 os.environ["GEO_CATEGORIES"] = ",".join(cfg_cats)
             except Exception:
@@ -406,8 +418,8 @@ if __name__ == "__main__":
     cli_parser.add_argument("--walk-cv", action="store_true", help="Use walk-forward CV (no future leakage) instead of Monte-Carlo block CV")
     cli_parser.add_argument("--cv-last-k-folds", type=int, help="Only use the last K folds before EARLY/TEST for Optuna CV to reduce CV↔TEST drift (default 5)")
     cli_parser.add_argument("--gap-months", type=int, default=0, help="Months gap between training and validation blocks (walk-forward CV)")
-    cli_parser.add_argument("--test-holdout-months", type=int, default=12, help="Final TEST size in months")
-    cli_parser.add_argument("--early-holdout-months", type=int, default=2, help="EARLY size in months")
+    cli_parser.add_argument("--test-holdout-months", type=int, default=2, help="Final TEST size in months")
+    cli_parser.add_argument("--early-holdout-months", type=int, default=1, help="EARLY size in months")
     cli_parser.add_argument("--no-search-halflife", action="store_true", help="Disable halflife search in Optuna")
     # Geo-POI CLI (train=serve parity via env consumed by model_training and prediction)
     cli_parser.add_argument("--poi-csv", help="Path to POI CSV (enables geo features)")

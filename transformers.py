@@ -1,10 +1,19 @@
 # transformers.py
-
+# Harden public API: rely solely on native encoders to avoid category-encoders tag drift.
+# All estimators exposed here are sklearn-compatible and free of external CE dependencies.
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
 import numpy as np
 import logging
 import traceback
+from sklearn.base import BaseEstimator, TransformerMixin
+
+__all__ = [
+    "DateTransformer",
+    "SuburbLOOEncoder",
+    "SuburbMonthLOOEncoder",
+]
+
+# NOTE: This module must remain category-encoders free; downstream imports rely on these native classes.
 
 class DateTransformer(BaseEstimator, TransformerMixin):
     """
@@ -64,124 +73,155 @@ class DateTransformer(BaseEstimator, TransformerMixin):
 
 
 # ------------------------------------------------------------------
-# NEW: Leave-One-Out encoder for high-cardinality 'Suburb'.
-# Fits within scikit-learn Pipeline so encoding is applied consistently
-# during both training and inference.
+# Native, version‑agnostic Leave‑One‑Out encoders
 # ------------------------------------------------------------------
 
-try:
-    from category_encoders import LeaveOneOutEncoder
-except ImportError:  # Fallback – allow rest of the codebase to run without hard dep.
-    LeaveOneOutEncoder = None  # type: ignore
+class _LOOBase(BaseEstimator, TransformerMixin):
+    """Utility base for native LOO with additive smoothing."""
+    def __init__(self, k: float = 10.0):
+        # k is the smoothing weight toward the global mean
+        self.k = float(k)
+        self.global_mean_: float | None = None
+        self.sum_: dict[str, float] | None = None
+        self.count_: dict[str, int] | None = None
+
+    @staticmethod
+    def _to_key(x) -> str:
+        return "nan" if pd.isna(x) else str(x)
+
+    def _fit_stats(self, keys: np.ndarray, y: np.ndarray):
+        sums: dict[str, float] = {}
+        cnts: dict[str, int] = {}
+        for key, val in zip(keys, y):
+            k = self._to_key(key)
+            if not np.isfinite(val):
+                continue
+            sums[k] = sums.get(k, 0.0) + float(val)
+            cnts[k] = cnts.get(k, 0) + 1
+        self.sum_, self.count_ = sums, cnts
+        gm = np.nanmean(y.astype(float)) if y.size else np.nan
+        self.global_mean_ = float(gm) if np.isfinite(gm) else 0.0
+
+    def _infer(self, key: str) -> float:
+        # Smoothed mean for inference (non‑TRAIN rows)
+        s = self.sum_.get(key, None) if self.sum_ else None
+        c = self.count_.get(key, 0) if self.count_ else 0
+        if s is None or c <= 0:
+            return float(self.global_mean_ or 0.0)
+        return float((s + self.k * (self.global_mean_ or 0.0)) / (c + self.k))
+
+    def _train_loo(self, key: str, y_i: float) -> float:
+        # Leave‑one‑out value for TRAIN rows
+        s = self.sum_.get(key, None) if self.sum_ else None
+        c = self.count_.get(key, 0) if self.count_ else 0
+        if s is None or c <= 1:
+            return float(self.global_mean_ or 0.0)
+        s_loo = float(s - y_i)
+        c_loo = int(c - 1)
+        return float((s_loo + self.k * (self.global_mean_ or 0.0)) / (c_loo + self.k))
 
 
-class SuburbLOOEncoder(BaseEstimator, TransformerMixin):
-    """Pipeline-friendly wrapper around category_encoders.LeaveOneOutEncoder.
-
-    – Accepts a single input column ('Suburb') and appends/overwrites
-      a numeric column 'Suburb_LOO'.  Original 'Suburb' is retained so
-      downstream CatBoost can still treat it as categorical **and** the
-      numeric LOO version can live in ``numeric_features``.
-    – When category_encoders is missing the transformer degrades to a
-      pass-through that creates a constant 0 column, but logs a warning
-      so training can continue without hard failure.
+class SuburbLOOEncoder(_LOOBase):
+    """Native LOO for a single categorical column (default: 'Suburb').
+    Adds/returns a float column named '<col>_LOO'.
     """
-
-    def __init__(self, col: str = "Suburb", sigma: float = 0.1, random_state: int = 42):
+    def __init__(self, col: str = "Suburb", k: float = 10.0, sigma: float | None = None, random_state: int | None = None):
+        # Accept legacy args (sigma, random_state) for backward compatibility.
+        super().__init__(k=(float(sigma) if sigma is not None else float(k)))
         self.col = col
-        self.sigma = sigma
-        self.random_state = random_state
-        self._encoder = None  # Will hold actual LeaveOneOutEncoder instance
 
     def fit(self, X: pd.DataFrame, y=None):
-        if LeaveOneOutEncoder is None:
-            logging.warning("category_encoders not installed; SuburbLOOEncoder will generate zeros.")
-            return self
-
         try:
-            if self.col not in X.columns:
-                raise ValueError(f"Column '{self.col}' not found in input data while fitting SuburbLOOEncoder.")
-
-            self._encoder = LeaveOneOutEncoder(cols=[self.col], sigma=self.sigma, random_state=self.random_state)
-            # Encoder expects y to compute target mean – raise if missing
             if y is None:
                 raise ValueError("Target 'y' must be provided to fit SuburbLOOEncoder.")
-            self._encoder.fit(X[[self.col]], y)
+            if self.col not in X.columns:
+                raise ValueError(f"Column '{self.col}' not found while fitting SuburbLOOEncoder.")
+            keys = X[self.col].astype("string").to_numpy()
+            yv = pd.to_numeric(pd.Series(y), errors="coerce").to_numpy()
+            self._fit_stats(keys, yv)
             return self
         except Exception as e:
-            logging.error(f"Error fitting SuburbLOOEncoder: {e}")
+            logging.error(f"SuburbLOOEncoder.fit failed: {e}")
             logging.error(traceback.format_exc())
             raise
 
     def transform(self, X: pd.DataFrame):
-        X_out = X.copy()
-
-        if LeaveOneOutEncoder is None or self._encoder is None:
-            # Graceful degradation: create constant zeros column if encoder not available
-            X_out[f"{self.col}_LOO"] = 0.0
-            return X_out
-
+        # Inference‑only transform (no TRAIN mask knowledge)
         try:
-            encoded = self._encoder.transform(X_out[[self.col]])[self.col]
-            X_out[f"{self.col}_LOO"] = encoded
+            X_out = X.copy()
+            vals: list[float] = []
+            for key in X_out[self.col].astype("string").to_numpy():
+                vals.append(self._infer(self._to_key(key)))
+            X_out[f"{self.col}_LOO"] = np.asarray(vals, dtype=np.float32)
             return X_out
         except Exception as e:
-            logging.error(f"Error in SuburbLOOEncoder.transform: {e}")
+            logging.error(f"SuburbLOOEncoder.transform failed: {e}")
+            logging.error(traceback.format_exc())
+            raise
+
+    def transform_all(self, X_all: pd.DataFrame, y_all: pd.Series, train_mask: np.ndarray):
+        """Leak‑safe generation for ALL rows (TRAIN gets true LOO; others get smoothed mean)."""
+        try:
+            keys = X_all[self.col].astype("string").to_numpy()
+            yv = pd.to_numeric(pd.Series(y_all), errors="coerce").to_numpy()
+            out = np.empty(keys.shape[0], dtype=np.float32)
+            for i, key in enumerate(keys):
+                k = self._to_key(key)
+                if bool(train_mask[i]):
+                    yi = float(yv[i]) if np.isfinite(yv[i]) else float(self.global_mean_ or 0.0)
+                    out[i] = self._train_loo(k, yi)
+                else:
+                    out[i] = self._infer(k)
+            return out
+        except Exception as e:
+            logging.error(f"SuburbLOOEncoder.transform_all failed: {e}")
             logging.error(traceback.format_exc())
             raise
 
     def get_feature_names_out(self, input_features=None):
-        # The transformer adds exactly one new numeric column
         return [f"{self.col}_LOO"]
 
 
-# ------------------------------------------------------------------
-# NEW: SuburbMonthLOOEncoder – captures seasonality within suburbs.
-# ------------------------------------------------------------------
-
-class SuburbMonthLOOEncoder(BaseEstimator, TransformerMixin):
-    """Target encoding for (Suburb, Month) groups using Leave-One-Out strategy.
-
-    Creates a new numeric column ``SuburbMonth_LOO``.
-    Must run BEFORE DateTransformer removes the month information.
-    """
-
-    def __init__(self, suburb_col: str = 'Suburb', date_col: str = 'Last Rental Date', sigma: float = 0.1, random_state: int = 42):
+class SuburbMonthLOOEncoder(_LOOBase):
+    """Native LOO for (Suburb × Month) with column name 'SuburbMonth_LOO'."""
+    def __init__(self, suburb_col: str = "Suburb", date_col: str = "Last Rental Date", k: float = 10.0, sigma: float | None = None, random_state: int | None = None):
+        super().__init__(k=(float(sigma) if sigma is not None else float(k)))
         self.suburb_col = suburb_col
         self.date_col = date_col
-        self.sigma = sigma
-        self.random_state = random_state
-        self._encoder = None
 
-    def _make_group(self, X: pd.DataFrame):
-        month_series = pd.to_datetime(X[self.date_col], errors='coerce').dt.month.fillna(0).astype(int)
-        return X[self.suburb_col].astype(str) + '_' + month_series.astype(str)
+    def _make_key(self, X: pd.DataFrame) -> np.ndarray:
+        mon = pd.to_datetime(X[self.date_col], errors="coerce").dt.month.fillna(0).astype(int).astype("string")
+        return (X[self.suburb_col].astype("string") + "_" + mon).to_numpy()
 
     def fit(self, X: pd.DataFrame, y=None):
-        if LeaveOneOutEncoder is None:
-            logging.warning("category_encoders not installed; SuburbMonthLOOEncoder will output zeros.")
-            return self
-
         if y is None:
-            raise ValueError("Target y must be provided for SuburbMonthLOOEncoder.fit().")
-
-        grp = self._make_group(X)
-        df_tmp = grp.to_frame(name='SuburbMonth')
-        self._encoder = LeaveOneOutEncoder(cols=['SuburbMonth'], sigma=self.sigma, random_state=self.random_state)
-        self._encoder.fit(df_tmp, y)
+            raise ValueError("Target 'y' must be provided to fit SuburbMonthLOOEncoder.")
+        if self.suburb_col not in X.columns or self.date_col not in X.columns:
+            raise ValueError("Required columns missing for SuburbMonthLOOEncoder.")
+        keys = self._make_key(X)
+        yv = pd.to_numeric(pd.Series(y), errors="coerce").to_numpy()
+        self._fit_stats(keys, yv)
         return self
 
     def transform(self, X: pd.DataFrame):
         X_out = X.copy()
-        if LeaveOneOutEncoder is None or self._encoder is None:
-            X_out['SuburbMonth_LOO'] = 0.0
-            return X_out
-
-        grp = self._make_group(X_out)
-        df_tmp = grp.to_frame(name='SuburbMonth')
-        vals = self._encoder.transform(df_tmp)['SuburbMonth']
-        X_out['SuburbMonth_LOO'] = vals
+        keys = self._make_key(X_out)
+        vals = [self._infer(self._to_key(k)) for k in keys]
+        X_out["SuburbMonth_LOO"] = np.asarray(vals, dtype=np.float32)
         return X_out
 
+    def transform_all(self, X_all: pd.DataFrame, y_all: pd.Series, train_mask: np.ndarray):
+        keys = self._make_key(X_all)
+        yv = pd.to_numeric(pd.Series(y_all), errors="coerce").to_numpy()
+        out = np.empty(keys.shape[0], dtype=np.float32)
+        for i, k in enumerate(keys):
+            key = self._to_key(k)
+            if bool(train_mask[i]):
+                yi = float(yv[i]) if np.isfinite(yv[i]) else float(self.global_mean_ or 0.0)
+                out[i] = self._train_loo(key, yi)
+            else:
+                out[i] = self._infer(key)
+        return out
+
     def get_feature_names_out(self, input_features=None):
-        return ['SuburbMonth_LOO']
+        return ["SuburbMonth_LOO"]

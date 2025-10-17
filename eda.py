@@ -3,12 +3,15 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 import logging
 import traceback
 import os
 from plotting import (
     plot_average_price_per_month,
-    plot_cumulative_change
+    plot_cumulative_change,
+    plot_full_correlation_heatmap,
+    plot_correlation_heatmap_alltypes,
 )
 from utils import save_plotly_fig
 
@@ -36,6 +39,10 @@ def perform_eda(data, plot_dir):
             logging.warning("Skipping monthly/cumulative plots due to missing columns.")
 
         advanced_statistical_tests(data, plot_dir)
+        # NEW: comprehensive numeric correlation heatmap across all rows/columns
+        plot_full_correlation_heatmap(data, plot_dir, filename="correlation_heatmap_full.png", method="pearson")
+        # NEW: all-types correlation heatmap (categorical/text encoded for plotting only)
+        plot_correlation_heatmap_alltypes(data, plot_dir, filename="correlation_heatmap_alltypes.png", method="pearson", max_ohe_levels=20)
         interactive_visualizations(data, plot_dir)
 
         logging.info("EDA completed successfully.")
@@ -618,19 +625,52 @@ if (!gd) { console.warn('Plot div not found: rolling_eq_mean_global'); } else {
                     except Exception as loo_err:
                         logging.warning(f"Could not compute Suburb_LOO for heatmap: {loo_err}")
 
+                def _annotate_heatmap(fig, x_labels, y_labels, values, fmt, *, threshold_ratio=0.5):
+                    arr = np.asarray(values, dtype=float)
+                    if arr.size == 0:
+                        return
+                    finite_mask = np.isfinite(arr)
+                    if not finite_mask.any():
+                        return
+                    max_abs = np.nanmax(np.abs(arr[finite_mask]))
+                    cutoff = max_abs * threshold_ratio if max_abs else 0.0
+                    for i, y_label in enumerate(y_labels):
+                        for j, x_label in enumerate(x_labels):
+                            val = arr[i, j]
+                            if not np.isfinite(val):
+                                continue
+                            color = "white" if (cutoff and abs(val) >= cutoff) else "black"
+                            fig.add_annotation(
+                                x=x_label,
+                                y=y_label,
+                                text=fmt.format(val),
+                                showarrow=False,
+                                font=dict(color=color),
+                                xanchor="center",
+                                yanchor="middle",
+                            )
+
                 heat_df = agg_stats.set_index('Suburb')[['MedianPrice','AvgPrice']].T  # 2 metrics rows
                 fig_heat = px.imshow(
                     heat_df,
                     color_continuous_scale='Viridis',
                     labels=dict(x='Suburb', y='Metric', color='NZD/sqm'),
                     aspect='auto',
-                    title='Heatmap of Median and Mean Annual Rental Price per sqm by Suburb',
-                    text_auto='.0f'
+                    title='Heatmap of Median and Mean Annual Rental Price per sqm by Suburb'
                 )
+                heat_values = heat_df.to_numpy(dtype=float)
+                _annotate_heatmap(
+                    fig_heat,
+                    heat_df.columns.tolist(),
+                    heat_df.index.tolist(),
+                    heat_values,
+                    "{:.0f}",
+                    threshold_ratio=0.55,
+                )
+                fig_heat.update_traces(hovertemplate='Value: %{z:.2f} NZD/sqm<extra></extra>')
                 # Format axes for readability
                 fig_heat.update_xaxes(side='bottom', tickangle=-45)
                 fig_heat.update_yaxes(autorange='reversed')
-                fig_heat.update_traces(hovertemplate='Value: %{z:.2f} NZD/sqm<extra></extra>')
 
                 out_html_heat = os.path.join(plot_dir, 'heatmap_median_price_per_sqm_by_suburb.html')
                 fig_heat.write_html(out_html_heat)
@@ -656,12 +696,21 @@ if (!gd) { console.warn('Plot div not found: rolling_eq_mean_global'); } else {
                     corr_matrix = numeric_subset.corr()
                     fig_corr = px.imshow(
                         corr_matrix,
-                        text_auto='.2f',
                         color_continuous_scale='RdBu_r',
                         zmin=-1, zmax=1,
                         labels=dict(x='Feature', y='Feature', color='Correlation'),
                         title='Interactive Correlation Heatmap (Selected Features)'
                     )
+                    corr_values = corr_matrix.to_numpy(dtype=float)
+                    _annotate_heatmap(
+                        fig_corr,
+                        corr_matrix.columns.tolist(),
+                        corr_matrix.index.tolist(),
+                        corr_values,
+                        "{:.2f}",
+                        threshold_ratio=0.4,
+                    )
+                    fig_corr.update_traces(hovertemplate='Corr: %{z:.2f}<extra></extra>')
                     fig_corr.update_xaxes(side='bottom', tickangle=-45)
                     out_corr_html = os.path.join(plot_dir, 'interactive_correlation_heatmap.html')
                     fig_corr.write_html(out_corr_html)
@@ -675,13 +724,14 @@ if (!gd) { console.warn('Plot div not found: rolling_eq_mean_global'); } else {
             logging.warning(f"Missing columns {missing}; skipping price-per-sqm interactive plot.")
 
         # --------------------------------------------------
-        # Gross Rental Yield per Suburb – Median vs Mean (interactive)
+        # Gross Rental Yield per Suburb - Median vs Mean (interactive)
         # --------------------------------------------------
         yield_cols = {'Last Rental Price', 'Capital Value', 'Suburb'}
         if yield_cols.issubset(data.columns):
             ytmp = data.copy()
             ytmp = ytmp[ytmp['Capital Value'] > 0]
-            ytmp['Gross_Yield'] = ytmp['Last Rental Price'] / ytmp['Capital Value'] * 100
+            # Interpret Last Rental Price as weekly rent; annualize to weekly*52
+            ytmp['Gross_Yield'] = (pd.to_numeric(ytmp['Last Rental Price'], errors='coerce') * 52.0) / pd.to_numeric(ytmp['Capital Value'], errors='coerce') * 100.0
 
             # Remove extreme yields (> 5× median of suburb)
             suburb_med_yield = ytmp.groupby('Suburb')['Gross_Yield'].median()
@@ -731,6 +781,39 @@ if (!gd) { console.warn('Plot div not found: rolling_eq_mean_global'); } else {
         else:
             logging.warning(f"Missing columns {yield_cols - set(data.columns)}; skipping rental-yield plot.")
 
+        # --------------------------------------------------
+        # Rented count by suburb (stacked by Bed) — interactive
+        # --------------------------------------------------
+        try:
+            if {'Suburb', 'Bed'}.issubset(data.columns):
+                dfc = data[['Suburb', 'Bed']].copy()
+                dfc['Bed'] = dfc['Bed'].astype(str)
+                counts = dfc.groupby(['Suburb', 'Bed'], as_index=False).size().rename(columns={'size': 'Count'})
+                # Order suburbs by total volume
+                total = counts.groupby('Suburb', as_index=False)['Count'].sum().sort_values('Count', ascending=False)
+                suburb_order = total['Suburb'].tolist()
+                import plotly.express as px
+                fig_cnt = px.bar(
+                    counts,
+                    x='Suburb',
+                    y='Count',
+                    color='Bed',
+                    barmode='stack',
+                    category_orders={'Suburb': suburb_order},
+                    title='Rented Properties by Suburb (stacked by Bed count)',
+                    template='plotly_white',
+                    height=650
+                )
+                fig_cnt.update_layout(xaxis_tickangle=-45)
+                save_plotly_fig(fig_cnt, 'rented_count_by_suburb_bed', plot_dir)
+                logging.info('Rented count by suburb (stacked by Bed) saved => rented_count_by_suburb_bed.html')
+            else:
+                logging.warning("Missing Suburb/Bed columns; skipping rented count stacked chart.")
+        except Exception as e:
+            logging.error(f"Error generating rented count by suburb chart: {e}")
+
     except Exception as e:
         logging.error(f"Error in interactive_visualizations: {e}")
         raise
+
+

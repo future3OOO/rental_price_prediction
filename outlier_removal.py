@@ -214,20 +214,25 @@ def save_outlier_report(
     out_dir = Path(cfg.log_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    reason_series = pd.Series(reason, index=df.index, dtype="object")
+    per_feat_series = {k: pd.Series(v, index=df.index) for k, v in per_feat_z.items()}
     artefacts = (
         df[mask]
         .assign(
-            z_rent=z_rent[mask],
-            z_cap=z_capv[mask],
-            votes=votes[mask],
-            maha=maha[mask],
-            reason=reason[mask],
-            **per_feat_z,
+            z_rent=pd.Series(z_rent, index=df.index)[mask],
+            z_cap=pd.Series(z_capv, index=df.index)[mask],
+            votes=pd.Series(votes, index=df.index)[mask],
+            maha=pd.Series(maha, index=df.index)[mask],
+            reason=reason_series[mask],
+            **{k: series[mask] for k, series in per_feat_series.items()},
         )
         .copy()
     )
 
-    artefacts.to_parquet(out_dir / cfg.artefact_name, index=False, engine="pyarrow")
+    try:
+        artefacts.to_parquet(out_dir / cfg.artefact_name, index=False, engine="pyarrow")
+    except ImportError:
+        logging.getLogger(__name__).warning("pyarrow missing; skipped parquet export for outlier report")
     artefacts.to_csv(out_dir / "removed_outliers.csv", index=False)
     df[~mask].to_csv(out_dir / "cleaned_data.csv", index=False)
     logging.getLogger(__name__).info(

@@ -25,38 +25,62 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shutil
 import json
 import logging
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Tuple
 
 import joblib
+
+try:
+    # Non-negative least squares for blend weights; neutral fallback if missing
+    from scipy.optimize import nnls as _nnls
+except Exception:  # pragma: no cover
+    _nnls = None
 import numpy as np
 import optuna
 import pandas as pd
 import scipy.sparse as sp
 from catboost import CatBoostRegressor, Pool
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.compose import ColumnTransformer
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.exceptions import DataConversionWarning
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
-from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.impute import (
+    SimpleImputer,
+)  # retained import for any non-numeric branches, not used in numeric pipes
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
+from sklearn.linear_model import LogisticRegression, SGDClassifier, Ridge
+from sklearn.model_selection import TimeSeriesSplit, KFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MaxAbsScaler, OrdinalEncoder
 from scipy.stats import skew
+from feature_engineering import FeatureEngineering
+from diagnostics.feature_checks import assert_recency_features, features_only_export
+
 try:
     from sklearn.feature_selection import mutual_info_regression as _mi_reg
 except Exception:
     _mi_reg = None  # type: ignore
 
 import warnings
+import platform
 import re
 import math
 
 import log_policy
+
+try:
+    from config import PLOT_DIR as _PLOT_DIR
+except Exception:
+    _PLOT_DIR = str(Path("plots").resolve())
 
 # ────────────────────── Log feature helpers ────────────────────── #
 
@@ -73,17 +97,20 @@ UNWANTED_FEATURES = {
 }
 GEO_COLUMNS = {"Latitude", "Longitude"}
 
+
 def _excluded_numeric_features() -> set[str]:
     raw = os.getenv("EXCLUDE_NUM_FEATURES", "")
     if not raw:
         return set()
     return {c.strip() for c in re.split(r"[;,]", raw) if c.strip()}
 
+
 def _filtered_numeric_columns(cols: list[str]) -> list[str]:
     excluded = _excluded_numeric_features()
     if not excluded:
         return cols
     return [c for c in cols if c not in excluded]
+
 
 def _apply_distance_clip(df: pd.DataFrame) -> pd.DataFrame:
     clip_km = float(os.getenv("GEO_CLIP_DIST_KM", "0") or 0)
@@ -92,9 +119,12 @@ def _apply_distance_clip(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce").clip(upper=clip_km)
     return df
 
+
 def _apply_feature_policy(df: pd.DataFrame, *, drop_geo: bool = True) -> pd.DataFrame:
     """Apply shared log policy, clip geo distances, and remove unwanted/raw geo features."""
-    df = log_policy.apply_log_policy(df, drop_raw=True)
+    # Allow keeping raw alongside log_ features for ablation via env toggle
+    _keep_raw = os.getenv("KEEP_RAW_WHEN_LOG", "0").lower() in {"1", "true", "yes"}
+    df = log_policy.apply_log_policy(df, drop_raw=not _keep_raw)
     df = _apply_distance_clip(df)
     drop = [c for c in UNWANTED_FEATURES if c in df.columns]
     if drop:
@@ -104,6 +134,57 @@ def _apply_feature_policy(df: pd.DataFrame, *, drop_geo: bool = True) -> pd.Data
         if geo_drop:
             df = df.drop(columns=geo_drop, errors="ignore")
     return df
+
+
+def _save_cb_curve(
+    model_obj, path: Path, *, label: str = "", sample_every: int = 1
+) -> None:
+    """Persist CatBoost eval curves to CSV (iteration, learn, test). Best-effort."""
+    try:
+        m = model_obj
+        if hasattr(m, "base"):
+            m = getattr(m, "base")
+        get_res = getattr(m, "get_evals_result", None)
+        if get_res is None:
+            return
+        res = get_res()
+        if not res:
+            return
+        learn_k = next(
+            (k for k in res.keys() if str(k).lower().startswith("learn")), None
+        )
+        val_k = next(
+            (k for k in res.keys() if str(k).lower().startswith("validation")), None
+        )
+        if learn_k is None or val_k is None:
+            return
+
+        def _first_metric(d: dict) -> str | None:
+            return next(iter(d.keys())) if isinstance(d, dict) and d else None
+
+        lm = _first_metric(res[learn_k])
+        vm = _first_metric(res[val_k])
+        if lm is None or vm is None:
+            return
+        learn = list(res[learn_k][lm])
+        test = list(res[val_k][vm])
+        n = min(len(learn), len(test))
+        it = list(range(n))
+        if sample_every > 1:
+            it = it[::sample_every]
+            learn = learn[::sample_every]
+            test = test[::sample_every]
+        import csv
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["iteration", f"learn_{lm}", f"test_{vm}", "label"])
+            for i, l, t in zip(it, learn, test):
+                w.writerow([int(i), float(l), float(t), label])
+    except Exception:
+        return
+
 
 def _mono_from_env(numeric_cols: list[str]) -> list[int] | None:
     """Resolve monotone constraints from env, with sensible defaults.
@@ -129,55 +210,110 @@ def _mono_from_env(numeric_cols: list[str]) -> list[int] | None:
         else:
             out.append(0)
     return out if any(v != 0 for v in out) else None
+
+
 # ────────────────────── Global settings & exports ────────────────────── #
 
 RANDOM_STATE = 42
 N_BLOCK_FOLDS = 12
 BLOCK_VAL_PCT = float(os.getenv("BLOCK_VAL_PCT", "0.20"))
-GAP_DAYS = int(os.getenv("GAP_DAYS", "0"))  # day-level embargo; if >0, overrides GAP_MONTHS
+GAP_DAYS = int(
+    os.getenv("GAP_DAYS", "0")
+)  # day-level embargo; if >0, overrides GAP_MONTHS
 TIME_DECAY_HALFLIFE_DAYS = int(os.getenv("TIME_DECAY_HALFLIFE_DAYS", "0"))
-CLAMP_PRED_TO_TARGET_RANGE = os.getenv("CLAMP_PRED_TO_TARGET_RANGE", "0").lower() in {"1","true","yes"}
+CLAMP_PRED_TO_TARGET_RANGE = os.getenv("CLAMP_PRED_TO_TARGET_RANGE", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 DRIFT_METRIC = os.getenv("DRIFT_METRIC", "wmae").lower()  # one of {wmae, rmse, mae}
 ENSEMBLE_SIZE = int(os.getenv("ENSEMBLE_SIZE", "1"))
-DROP_REGION_IDS_IN_CV = os.getenv("DROP_REGION_IDS_IN_CV", "0").lower() in {"1","true","yes"}
+# Train Ridge only on rows with Bed >= RIDGE_MIN_BED (0 disables filtering)
+RIDGE_MIN_BED = int(os.getenv("RIDGE_MIN_BED", "0"))
+MONO_DEBUG = os.getenv("MONO_DEBUG", "0").lower() in {"1", "true", "yes"}
+LOG_CURVES = os.getenv("LOG_CURVES", "0").lower() in {"1", "true", "yes"}
+LOG_CV_CURVES = os.getenv("LOG_CV_CURVES", "0").lower() in {"1", "true", "yes"}
+try:
+    LOG_CURVES_EVERY = max(1, int(os.getenv("LOG_CURVES_EVERY", "10")))
+except Exception:
+    LOG_CURVES_EVERY = 10
+DROP_REGION_IDS_IN_CV = os.getenv("DROP_REGION_IDS_IN_CV", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # NEW toggles
-TEST_HOLDOUT_MONTHS = int(os.getenv("TEST_HOLDOUT_MONTHS", "12"))  # 12-month TEST by default
+TEST_HOLDOUT_MONTHS = int(
+    os.getenv("TEST_HOLDOUT_MONTHS", "12")
+)  # 12-month TEST by default
 EARLY_HOLDOUT_MONTHS = int(os.getenv("EARLY_HOLDOUT_MONTHS", "2"))
 GAP_MONTHS_OVERRIDE = int(os.getenv("GAP_MONTHS", "1"))
-SEARCH_HALFLIFE = os.getenv("SEARCH_HALFLIFE", "1").lower() in {"1","true","yes"}
-SAVE_QUANTILE_MODELS = os.getenv("SAVE_QUANTILE_MODELS", "1").lower() in {"1","true","yes"}
-QUANTILE_ALPHAS = [float(a) for a in os.getenv("QUANTILE_ALPHAS", "0.1,0.9").split(",") if a.strip()]
-ENABLE_CQR = os.getenv("ENABLE_CQR", "1").lower() in {"1","true","yes"}
+SEARCH_HALFLIFE = os.getenv("SEARCH_HALFLIFE", "1").lower() in {"1", "true", "yes"}
+SAVE_QUANTILE_MODELS = os.getenv("SAVE_QUANTILE_MODELS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+QUANTILE_ALPHAS = [
+    float(a) for a in os.getenv("QUANTILE_ALPHAS", "0.1,0.9").split(",") if a.strip()
+]
+ENABLE_CQR = os.getenv("ENABLE_CQR", "1").lower() in {"1", "true", "yes"}
 PI_ALPHA = float(os.getenv("PI_ALPHA", "0.20"))  # 80% coverage
-ENABLE_ADVERSARIAL_VALID = os.getenv("ENABLE_ADVERSARIAL_VALID", "1").lower() in {"1","true","yes"}
+ENABLE_ADVERSARIAL_VALID = os.getenv("ENABLE_ADVERSARIAL_VALID", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 ADV_LOG_SOLVER = os.getenv("ADV_LOG_SOLVER", "saga")
 ADV_LOG_C = float(os.getenv("ADV_LOG_C", "0.25"))
 ADV_LOG_MAX_ITER = int(os.getenv("ADV_LOG_MAX_ITER", "1000"))
 ADV_LOG_TOL = float(os.getenv("ADV_LOG_TOL", "1e-3"))
 ADV_WEIGHT_CAP = float(os.getenv("ADV_WEIGHT_CAP", "3.0"))
 ADV_WEIGHT_FLOOR = float(os.getenv("ADV_WEIGHT_FLOOR", "0.33"))
-AUTO_DRIFT_SHRINK = os.getenv("AUTO_DRIFT_SHRINK", "0").lower() in {"1","true","yes"}
+AUTO_DRIFT_SHRINK = os.getenv("AUTO_DRIFT_SHRINK", "0").lower() in {"1", "true", "yes"}
 ADV_AUC_STRONG = float(os.getenv("ADV_AUC_STRONG", "0.90"))
 EXCLUDE_CAT_FEATURES = tuple(
-    x.strip().lower() for x in os.getenv("EXCLUDE_CAT_FEATURES", "street_address,__geo_query__,Valuation Date").split(",") if x.strip()
+    x.strip().lower()
+    for x in os.getenv(
+        "EXCLUDE_CAT_FEATURES", "street_address,__geo_query__,Valuation Date"
+    ).split(",")
+    if x.strip()
 )
-EXCLUDE_GEO_BEARING = os.getenv("EXCLUDE_GEO_BEARING", "0").lower() in {"1","true","yes"}
+EXCLUDE_GEO_BEARING = os.getenv("EXCLUDE_GEO_BEARING", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 ALWAYS_KEEP_GEO = tuple(
-    s.strip().lower() for s in os.getenv(
+    s.strip().lower()
+    for s in os.getenv(
         "ALWAYS_KEEP_GEO",
-        "dist_university_km,acc_university,dist_school_primary_km,dist_school_intermediate_km,dist_school_high_km,acc_school_primary,acc_school_intermediate,acc_school_high"
-    ).split(",") if s.strip()
+        "dist_university_km,acc_university,dist_school_primary_km,dist_school_intermediate_km,dist_school_high_km,acc_school_primary,acc_school_intermediate,acc_school_high",
+    ).split(",")
+    if s.strip()
 )
-ENABLE_MEDIAN_BLEND = os.getenv("ENABLE_MEDIAN_BLEND", "1").lower() in {"1","true","yes"}
+ENABLE_MEDIAN_BLEND = os.getenv("ENABLE_MEDIAN_BLEND", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 MEDIAN_BLEND_LAMBDA_MAX = float(os.getenv("MEDIAN_BLEND_LAMBDA_MAX", "0.35"))
-ENABLE_RESIDUAL_BOOSTER = os.getenv("ENABLE_RESIDUAL_BOOSTER", "0").lower() in {"1","true","yes"}
+ENABLE_RESIDUAL_BOOSTER = os.getenv("ENABLE_RESIDUAL_BOOSTER", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 TEACHER_PIPELINE = os.getenv("TEACHER_PIPELINE", "").strip()
 GEO_POI_CSV = os.getenv("GEO_POI_CSV", "").strip()
 GEO_INCLUDE_BEARINGS = os.getenv("GEO_INCLUDE_BEARINGS", "0").lower() in {
-    "1", "true", "yes"
+    "1",
+    "true",
+    "yes",
 }
 GEO_USE_ACCESSIBILITY = os.getenv("GEO_USE_ACCESSIBILITY", "0").lower() in {
-    "1", "true", "yes"
+    "1",
+    "true",
+    "yes",
 }
 _GEO_SCHOOL_MODE_RAW = (
     (os.getenv("GEO_SCHOOL_FEATURE", "dist_min") or "dist_min").strip().lower()
@@ -187,8 +323,21 @@ GEO_SCHOOL_FEATURE = (
     _GEO_SCHOOL_MODE_RAW if _GEO_SCHOOL_MODE_RAW in _GEO_SCHOOL_MODES else "dist_min"
 )
 ADV_AUC_WARN = float(os.getenv("ADV_AUC_WARN", "0.75"))
+# Tail-aware weighting (upweight expensive rentals in TRAIN/EARLY)
+TAIL_THRESH = float(os.getenv("TAIL_THRESH", "1500"))
+TAIL_MULT = float(os.getenv("TAIL_MULT", "2"))
+# NEW: blending & CV mode controls
+BLEND_AT_SERVE = os.getenv("BLEND_AT_SERVE", "1").lower() in {"1", "true", "yes"}
+TRAIN_RIDGE = os.getenv("TRAIN_RIDGE", "1").lower() in {"1", "true", "yes"}
+CV_MODE = (
+    os.getenv("CV_MODE", "rental_time").strip().lower()
+)  # "rental_time" (default) or "ames_kfold"
+AMES_KFOLD_SPLITS = int(os.getenv("AMES_KFOLD_SPLITS", "10"))
+AMES_KFOLD_SEED = int(os.getenv("AMES_KFOLD_SEED", "42"))
 # NEW: domain-importance weighting (covariate-shift mitigation)
-ENABLE_IMPORTANCE_WEIGHTED_FIT = os.getenv("ENABLE_IMPORTANCE_WEIGHTED_FIT", "1").lower() in {"1","true","yes"}
+ENABLE_IMPORTANCE_WEIGHTED_FIT = os.getenv(
+    "ENABLE_IMPORTANCE_WEIGHTED_FIT", "1"
+).lower() in {"1", "true", "yes"}
 IW_ENABLE_ON_ADV_AUC = float(os.getenv("IW_ENABLE_ON_ADV_AUC", "0.85"))
 try:
     _iw_clip_vals = [float(x) for x in os.getenv("IW_CLIP", "0.2,5.0").split(",")]
@@ -198,11 +347,13 @@ except Exception:
 IW_TEMP = float(os.getenv("IW_TEMP", "1.0"))
 
 # Performance guards for diagnostics (train-time only)
-ADV_MAX_ROWS = int(os.getenv("ADV_MAX_ROWS", "6000"))   # cap rows for adversarial LR probe
-IW_MAX_ROWS = int(os.getenv("IW_MAX_ROWS", "8000"))     # cap rows for SGD density-ratio
+ADV_MAX_ROWS = int(
+    os.getenv("ADV_MAX_ROWS", "6000")
+)  # cap rows for adversarial LR probe
+IW_MAX_ROWS = int(os.getenv("IW_MAX_ROWS", "8000"))  # cap rows for SGD density-ratio
 
 # Optuna budget (can be overridden by env/CLI)
-OPTUNA_TRIALS = int(os.getenv("OPTUNA_TRIALS", "20"))
+OPTUNA_TRIALS = int(os.getenv("OPTUNA_TRIALS", "200"))
 OPTUNA_TIMEOUT = int(os.getenv("OPTUNA_TIMEOUT_SEC", "0"))  # 0 = no time limit
 # Parallel trials (default to 8 parallel jobs)
 OPTUNA_N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "8"))
@@ -221,9 +372,19 @@ DEFAULT_TRIALS = OPTUNA_TRIALS
 DEFAULT_TIMEOUT = OPTUNA_TIMEOUT
 
 # Outlier handling knobs (env-overridable)
-ENABLE_OUTLIER_SCORER = os.getenv("ENABLE_OUTLIER_SCORER", "1").lower() in {"1", "true", "yes"}
-OUTLIER_WEIGHT_MULT = float(os.getenv("OUTLIER_WEIGHT_MULT", "0.35"))  # down-weight factor
-OUTLIER_DROP_TRAIN = os.getenv("OUTLIER_DROP_TRAIN", "0").lower() in {"1", "true", "yes"}
+ENABLE_OUTLIER_SCORER = os.getenv("ENABLE_OUTLIER_SCORER", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OUTLIER_WEIGHT_MULT = float(
+    os.getenv("OUTLIER_WEIGHT_MULT", "0.35")
+)  # down-weight factor
+OUTLIER_DROP_TRAIN = os.getenv("OUTLIER_DROP_TRAIN", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # Monotonic constraints toggle (off by default due to past regressions)
 ENFORCE_MONOTONE = os.getenv("ENFORCE_MONOTONE", "0").lower() in {"1", "true", "yes"}
@@ -231,12 +392,48 @@ ENFORCE_MONOTONE = os.getenv("ENFORCE_MONOTONE", "0").lower() in {"1", "true", "
 ARTIFACT_DIR = Path("artifacts")
 ARTIFACT_DIR.mkdir(exist_ok=True, parents=True)
 
+# Standalone prediction service artifact directory (mirrored)
+PREDICTION_ARTIFACT_DIR = Path("artifacts/Prediction/artifacts")
+PREDICTION_ARTIFACT_DIR.mkdir(exist_ok=True, parents=True)
+
+PLOTS_DIR = Path(_PLOT_DIR)
+PLOTS_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def _duplicate_artifact(source_path: Path, artifact_type: str = "file") -> None:
+    """Duplicate artifact to standalone prediction service directory.
+
+    Maintains same relative path structure so metadata remains valid.
+    artifact_type: 'file' (copy file) or 'skip' (don't copy, e.g., absolute paths)
+    """
+    if not source_path or artifact_type == "skip":
+        return
+
+    try:
+        # Get relative path from artifacts/ directory
+        rel_path = source_path.relative_to(ARTIFACT_DIR)
+        dest_path = PREDICTION_ARTIFACT_DIR / rel_path
+
+        # Ensure parent directory exists
+        dest_path.parent.mkdir(exist_ok=True, parents=True)
+
+        # Copy file
+        import shutil
+
+        shutil.copy2(source_path, dest_path)
+        logging.debug(f"Duplicated artifact: {source_path.name} -> Prediction service")
+    except Exception as e:
+        logging.warning(f"Failed to duplicate artifact {source_path}: {e}")
+
+
 # Headless plotting backend (guard against Tkinter crashes during training threads)
 import os as _os_for_mpl
+
 _os_for_mpl.environ.setdefault("MPLBACKEND", "Agg")
 _os_for_mpl.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:  # pragma: no cover
     import matplotlib as _mpl  # type: ignore
+
     if str(getattr(_mpl, "get_backend", lambda: "")()).lower().endswith("agg") is False:
         _mpl.use("Agg", force=True)
 except Exception:
@@ -265,38 +462,63 @@ BEST_PARAMS_PRODUCTION = {
     "random_seed": RANDOM_STATE,
 }
 
+
 # Helper: coerce arbitrary arrays/frames to numeric for light linear probes
 def _coerce_for_adv_lr(arr) -> np.ndarray:
-    """Coerce arbitrary (dense/sparse, mixed-type) arrays to dense float32.
+    """Coerce arbitrary (dense/sparse, mixed dtypes) to float32 with NaNs/Infs → 0.
 
     - If sparse and numeric → toarray().astype(float32)
     - If contains non-numerics → factorize per-column via pandas then to numpy
+    - Always finish with np.nan_to_num to guarantee numeric, NaN-free input
     """
     if sp.issparse(arr):
         try:
-            return arr.astype(np.float32).toarray()
+            out = arr.astype(np.float32).toarray()
         except Exception:
             dense = arr.toarray()
             df_ = pd.DataFrame(dense)
+            for c in df_.columns:
+                s = df_[c]
+                if not pd.api.types.is_numeric_dtype(s):
+                    df_[c] = pd.Categorical(s).codes.astype(np.float32)
+                else:
+                    df_[c] = pd.to_numeric(s, errors="coerce").astype(np.float32)
+            out = df_.to_numpy(dtype=np.float32, copy=False)
     else:
-        df_ = pd.DataFrame(arr) if not isinstance(arr, pd.DataFrame) else arr.copy()
-    # If df_ not yet defined (numeric sparse case), create from dense array above
-    if 'df_' not in locals():  # pragma: no cover (defensive)
-        df_ = pd.DataFrame(np.asarray(arr))
-    for c in df_.columns:
-        s = df_[c]
-        if not pd.api.types.is_numeric_dtype(s):
-            df_[c] = pd.Categorical(s).codes.astype(np.float32)
-        else:
-            df_[c] = pd.to_numeric(s, errors="coerce").astype(np.float32)
-    return df_.to_numpy(dtype=np.float32, copy=False)
+        df_ = arr if isinstance(arr, pd.DataFrame) else pd.DataFrame(arr)
+        for c in df_.columns:
+            s = df_[c]
+            if not pd.api.types.is_numeric_dtype(s):
+                df_[c] = pd.Categorical(s).codes.astype(np.float32)
+            else:
+                df_[c] = pd.to_numeric(s, errors="coerce").astype(np.float32)
+        out = df_.to_numpy(dtype=np.float32, copy=False)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(
+        np.float32, copy=False
+    )
+
 
 # Feature toggles
-USE_SUBURB_365D_MEDIAN = os.getenv("USE_SUBURB_365D_MEDIAN", "1").lower() in {"1", "true", "yes"}
-USE_SUBURB_FEATURES = os.getenv("USE_SUBURB_FEATURES", "1").lower() in {"1", "true", "yes"}
+USE_SUBURB_365D_MEDIAN = os.getenv("USE_SUBURB_365D_MEDIAN", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+USE_SUBURB_FEATURES = os.getenv("USE_SUBURB_FEATURES", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 USE_SUBURB_LOO = os.getenv("USE_SUBURB_LOO", "0").lower() in {"1", "true", "yes"}
-USE_SUBURB_MEDIANS = os.getenv("USE_SUBURB_MEDIANS", "1").lower() in {"1", "true", "yes"}
+USE_SUBURB_MEDIANS = os.getenv("USE_SUBURB_MEDIANS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 USE_SUBURB_RANK = os.getenv("USE_SUBURB_RANK", "0").lower() in {"1", "true", "yes"}
+logging.info(
+    f"DEBUG FLAGS: USE_SUBURB_FEATURES={USE_SUBURB_FEATURES}, USE_SUBURB_MEDIANS={USE_SUBURB_MEDIANS}, LOO={USE_SUBURB_LOO}"
+)
 
 # Median computation controls (for stability when USE_SUBURB_MEDIANS=1)
 USE_LOG_MEDIANS = os.getenv("USE_LOG_MEDIANS", "1").lower() in {"1", "true", "yes"}
@@ -304,7 +526,11 @@ SUBURB_MED_WINDOW_DAYS = int(os.getenv("SUBURB_MED_WINDOW_DAYS", "90"))
 SUBURB_MED_MIN_COUNT = int(os.getenv("SUBURB_MED_MIN_COUNT", "8"))
 SUBURB_MED365_MIN_COUNT = int(os.getenv("SUBURB_MED365_MIN_COUNT", "16"))
 SUBURB_BED_MIN_COUNT = int(os.getenv("SUBURB_BED_MIN_COUNT", "6"))
-INCLUDE_RAW_SUBURB_MEDIANS = os.getenv("INCLUDE_RAW_SUBURB_MEDIANS", "0").lower() in {"1", "true", "yes"}
+INCLUDE_RAW_SUBURB_MEDIANS = os.getenv("INCLUDE_RAW_SUBURB_MEDIANS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # Silence benign warnings
 warnings.filterwarnings("ignore", category=DataConversionWarning)
@@ -326,6 +552,7 @@ except Exception:
 
 # ────────────────────────── Logging helper ────────────────────────── #
 
+
 def _setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -338,9 +565,11 @@ def _setup_logging(level: str = "INFO") -> None:
 def _gpu_available() -> bool:
     try:
         from catboost.utils import get_gpu_device_count  # type: ignore
+
         return int(get_gpu_device_count()) > 0
     except Exception:
         return False
+
 
 # ───────────────────── Gap & weighting helpers ───────────────────── #
 def _auto_gap_days() -> int:
@@ -357,7 +586,10 @@ def _auto_gap_days() -> int:
             days = max(days, 365)
     return max(0, int(days + 7))
 
-def _recency_weights(dates: pd.Series, ref_date: pd.Timestamp, halflife_days: int) -> np.ndarray:
+
+def _recency_weights(
+    dates: pd.Series, ref_date: pd.Timestamp, halflife_days: int
+) -> np.ndarray:
     """Exponential time-decay weights; larger for recent rows."""
     if halflife_days <= 0:
         return np.ones(len(dates), dtype=float)
@@ -365,9 +597,9 @@ def _recency_weights(dates: pd.Series, ref_date: pd.Timestamp, halflife_days: in
     td = pd.to_datetime(ref_date) - pd.to_datetime(dates)
     try:
         # Convert timedeltas to integer days without relying on .dt for Index
-        age = (td / np.timedelta64(1, 'D')).astype(int)
+        age = (td / np.timedelta64(1, "D")).astype(int)
     except Exception:
-        age = pd.to_timedelta(td).astype('timedelta64[D]').astype(int)
+        age = pd.to_timedelta(td).astype("timedelta64[D]").astype(int)
     age = np.clip(np.asarray(age, dtype=int), 0, None)
     lam = math.log(2.0) / max(halflife_days, 1)
     w = np.exp(-lam * age).astype(float)
@@ -376,10 +608,176 @@ def _recency_weights(dates: pd.Series, ref_date: pd.Timestamp, halflife_days: in
     return (w / m) if m > 0 else w
 
 
+# ───────────────────────── Streaming OOF metrics (no concatenation) ───────────────────────── #
+def _oof_metrics_from_parts(
+    parts_true: list[np.ndarray], parts_pred: list[np.ndarray]
+) -> dict[str, float]:
+    """
+    Memory-safe OOF metrics from fold parts. Computes:
+      - R2 on original scale
+      - R2 on log1p scale (pred clipped to >=0)
+      - MAE, RMSE
+      - weighted MAE/RMSE with inverse-sqrt weights
+    """
+    sst = ssr = 0.0
+    sst_log = ssr_log = 0.0
+    n = 0
+    abs_sum = 0.0
+    sq_sum = 0.0
+    w_abs_sum = 0.0
+    w_sq_sum = 0.0
+    w_sum = 0.0
+    # global mean via two-pass robust aggregation
+    all_means: list[float] = []
+    for p in parts_true:
+        if p is None or np.size(p) == 0:
+            continue
+        try:
+            all_means.append(float(np.nanmean(np.asarray(p, dtype=np.float32))))
+        except Exception:
+            pass
+    ybar = float(np.nanmean(np.asarray(all_means))) if all_means else 0.0
+    for yt, yp in zip(parts_true, parts_pred):
+        y = np.asarray(yt, dtype=np.float32)
+        yhat = np.asarray(yp, dtype=np.float32)
+        m = np.isfinite(y) & np.isfinite(yhat)
+        if not m.any():
+            continue
+        y = y[m]
+        yhat = yhat[m]
+        sst += float(np.sum((y - ybar) ** 2))
+        ssr += float(np.sum((y - yhat) ** 2))
+        yl = np.log1p(y)
+        yhl = np.log1p(np.clip(yhat, a_min=0.0, a_max=None))
+        ybar_l = float(np.nanmean(yl))
+        sst_log += float(np.sum((yl - ybar_l) ** 2))
+        ssr_log += float(np.sum((yl - yhl) ** 2))
+        abs_sum += float(np.sum(np.abs(y - yhat)))
+        sq_sum += float(np.sum((y - yhat) ** 2))
+        cap = float(np.percentile(y, 99.5)) if y.size else 1.0
+        cap = (
+            cap
+            if (np.isfinite(cap) and cap > 0)
+            else (float(np.nanmax(y)) if y.size else 1.0)
+        )
+        w = 1.0 / np.sqrt(np.maximum(1.0, np.minimum(cap, y)))
+        w_sum += float(np.sum(w))
+        w_abs_sum += float(np.sum(w * np.abs(y - yhat)))
+        w_sq_sum += float(np.sum(w * (y - yhat) ** 2))
+        n += y.shape[0]
+    r2 = float(1.0 - (ssr / max(sst, 1e-12))) if n > 0 else float("nan")
+    r2_log = float(1.0 - (ssr_log / max(sst_log, 1e-12))) if n > 0 else float("nan")
+    mae = float(abs_sum / max(n, 1))
+    rmse = float(np.sqrt(sq_sum / max(n, 1)))
+    wmae = float(w_abs_sum / max(w_sum, 1e-12))
+    wrmse = float(np.sqrt(w_sq_sum / max(w_sum, 1e-12)))
+    return {
+        "r2": r2,
+        "r2_log": r2_log,
+        "mae": mae,
+        "rmse": rmse,
+        "wmae": wmae,
+        "wrmse": wrmse,
+    }
+
+
+# ───────────────── Streaming OOF metrics & 2×2 NNLS (no concatenation) ───────────────── #
+def _streaming_r2(parts_true: list[np.ndarray], parts_pred: list[np.ndarray]) -> float:
+    """Compute R² without concatenating arrays."""
+    n = 0
+    sum_y = 0.0
+    sum_y2 = 0.0
+    for t in parts_true:
+        t = np.asarray(t, dtype=np.float64).reshape(-1)
+        n += t.size
+        sum_y += float(t.sum())
+        sum_y2 += float((t * t).sum())
+    if n == 0:
+        return float("nan")
+    mean_y = sum_y / n
+    sst = 0.0
+    ssr = 0.0
+    for t, p in zip(parts_true, parts_pred):
+        t = np.asarray(t, dtype=np.float64).reshape(-1)
+        p = np.asarray(p, dtype=np.float64).reshape(-1)
+        sst += float(((t - mean_y) ** 2).sum())
+        ssr += float(((t - p) ** 2).sum())
+    return float(1.0 - (ssr / sst)) if sst > 0 else float("nan")
+
+
+def _streaming_r2_log(
+    parts_true: list[np.ndarray], parts_pred: list[np.ndarray]
+) -> float:
+    """R² on log1p scale, streaming."""
+    T = [np.log1p(np.asarray(t, float).clip(min=0)) for t in parts_true]
+    P = [np.log1p(np.asarray(p, float).clip(min=0)) for p in parts_pred]
+    return _streaming_r2(T, P)
+
+
+def _nnls_2col_from_stream(
+    cb_parts: list[np.ndarray],
+    rc_parts: list[np.ndarray] | None,
+    y_parts: list[np.ndarray],
+    mask_parts: list[np.ndarray] | None = None,
+) -> tuple[list[str], np.ndarray]:
+    """
+    Fit non-negative weights w for columns [CatBoost, (optional) Ridge] using streaming
+    X'X and X'y accumulation. Supports an optional boolean mask (e.g., Bed gate) for Ridge.
+    """
+    labels: list[str] = ["CatBoost"]
+    g11 = g22 = g12 = 0.0
+    c1 = c2 = 0.0
+    has_ridge = rc_parts is not None and len(rc_parts) == len(cb_parts)
+    if has_ridge:
+        labels.append("Ridge")
+    for i in range(len(cb_parts)):
+        y = np.asarray(y_parts[i], float).reshape(-1)
+        x1 = np.asarray(cb_parts[i], float).reshape(-1)
+        if has_ridge:
+            x2 = np.asarray(rc_parts[i], float).reshape(-1)
+            if (
+                mask_parts is not None
+                and i < len(mask_parts)
+                and mask_parts[i] is not None
+            ):
+                m = np.asarray(mask_parts[i], bool).reshape(-1)
+                # neutralize Ridge outside mask
+                x2 = np.where(m, x2, x1)
+            g22 += float((x2 * x2).sum())
+            g12 += float((x1 * x2).sum())
+            c2 += float((x2 * y).sum())
+        g11 += float((x1 * x1).sum())
+        c1 += float((x1 * y).sum())
+    if not has_ridge:
+        w = np.array([c1 / g11 if g11 > 0 else 1.0], float)
+        return labels, w
+    # Solve unconstrained 2×2
+    G = np.array([[g11, g12], [g12, g22]], float)
+    c = np.array([c1, c2], float)
+    try:
+        w = np.linalg.solve(G, c)
+    except Exception:
+        w = np.linalg.lstsq(G, c, rcond=None)[0]
+    # NNLS clamp to >=0 and re-solve if needed
+    if w[0] >= 0 and w[1] >= 0:
+        return labels, w
+    # Try single-arm solutions
+    w1 = max(c1 / g11, 0.0) if g11 > 0 else 0.0
+    w2 = max(c2 / g22, 0.0) if g22 > 0 else 0.0
+    obj1 = g11 * w1 * w1 - 2 * c1 * w1
+    obj2 = g22 * w2 * w2 - 2 * c2 * w2
+    if obj1 <= obj2:
+        return labels, np.array([w1, 0.0], float)
+    else:
+        return labels, np.array([0.0, w2], float)
+
+
 # ─────────────────────── Custom transformers ─────────────────────── #
+
 
 class RareCategoryBinner(BaseEstimator, TransformerMixin):
     """Bins infrequent labels to 'OTHER' to stabilise categorical signal."""
+
     def __init__(self, min_count: int = 20, replacement: str = "OTHER"):
         self.min_count = min_count
         self.replacement = replacement
@@ -398,15 +796,19 @@ class RareCategoryBinner(BaseEstimator, TransformerMixin):
         for col in X_df.columns:
             keep = self.frequent_.get(col, set())
             ser = X_df[col].astype("string")
-            ser = ser.where(ser.isin(keep), other=self.replacement).fillna(self.replacement)
+            ser = ser.where(ser.isin(keep), other=self.replacement).fillna(
+                self.replacement
+            )
             X_df[col] = ser.astype("string")
         return X_df
 
 
 class MissingLevelImputer(BaseEstimator, TransformerMixin):
     """Impute missing categoricals to a dedicated 'MISSING' level (train=serve)."""
+
     def fit(self, X, y=None):
         return self
+
     def transform(self, X):
         X_df = pd.DataFrame(X).copy()
         for col in X_df.columns:
@@ -417,10 +819,13 @@ class MissingLevelImputer(BaseEstimator, TransformerMixin):
             X_df[col] = ser
         return X_df
 
+
 class ToStringTransformer(BaseEstimator, TransformerMixin):
     """Ensure string dtype for CatBoost native-categorical ingestion."""
+
     def fit(self, X, y=None):
         return self
+
     def transform(self, X):
         X_df = pd.DataFrame(X).copy()
         for col in X_df.columns:
@@ -434,6 +839,7 @@ class PreInputAdapter(BaseEstimator, TransformerMixin):
     This mirrors _clean_strings/_apply_ordinals/add_date_parts used earlier so that
     the persisted preprocessor can reproduce those columns at serve-time.
     """
+
     def __init__(self, *, date_col: str):
         self.date_col = date_col
 
@@ -448,18 +854,180 @@ class PreInputAdapter(BaseEstimator, TransformerMixin):
         if self.date_col in df.columns:
             df = add_date_parts(df, self.date_col)
         # Safe log features for skewed numerics commonly used downstream (exclude Car)
-        for base_col in ("Land Value", "Capital Value", "Days on Market"):
+        for base_col in (
+            "Land Value",
+            "Capital Value",
+            "Improvement Value",
+            "Land Size (sqm)",
+            "Floor Size (sqm)",
+            "Days on Market",
+        ):
             if base_col in df.columns and f"log_{base_col}" not in df.columns:
-                df[f"log_{base_col}"] = np.log1p(pd.to_numeric(df[base_col], errors="coerce"))
+                df[f"log_{base_col}"] = np.log1p(
+                    pd.to_numeric(df[base_col], errors="coerce").clip(lower=0)
+                )
+
+        # Zero-indicator flags (capture 0/NaN after coercion)
+        for zc in ("Land Size (sqm)", "Floor Size (sqm)"):
+            if zc in df.columns and f"{zc}_is_zero" not in df.columns:
+                df[f"{zc}_is_zero"] = (
+                    pd.to_numeric(df[zc], errors="coerce").fillna(0.0) <= 0.0
+                ).astype(int)
         return df
+
+
+# NEW: encode any object/Unicode columns after the CatBoost preprocessor
+class AutoOrdinalOnObjects(BaseEstimator, TransformerMixin):
+    """Detect object/Unicode columns at fit, ordinal-encode them with unknown_value=-1 (int)."""
+
+    def __init__(self, unknown_value: int = -1):
+        # sklearn>=1.6 requires unknown_value to be an integer or np.nan when
+        # handle_unknown='use_encoded_value'. Use int -1 here for portability.
+        self.unknown_value = int(unknown_value)
+        self._ct: ColumnTransformer | None = None
+        self.obj_idx_: list[int] = []
+
+    def fit(self, X, y=None):
+        A = np.asarray(X, dtype=object)
+        # sample a few rows to decide which columns are string-like
+        rows = min(256, A.shape[0]) if hasattr(A, "shape") else 0
+        obj_idx = []
+        for j in range(A.shape[1]):
+            col = A[:rows, j] if rows else A[:, j]
+            # detect strings quickly
+            if any(isinstance(v, str) for v in col):
+                obj_idx.append(int(j))
+        self.obj_idx_ = sorted(set(obj_idx))
+        if self.obj_idx_:
+            enc = OrdinalEncoder(
+                handle_unknown="use_encoded_value",
+                unknown_value=int(self.unknown_value),
+                dtype=np.float64,
+            )
+            self._ct = ColumnTransformer(
+                [("ord", enc, self.obj_idx_)],
+                remainder="passthrough",
+                sparse_threshold=0.0,
+            )
+            self._ct.fit(A, y)
+        return self
+
+    def transform(self, X):
+        A = np.asarray(X, dtype=object)
+        if self._ct is None:
+            # no object columns detected; ensure numeric dtype
+            return A.astype(np.float64, copy=False)
+        return np.asarray(self._ct.transform(A), dtype=np.float64)
+
+
+class SafeMedianImputer(BaseEstimator, TransformerMixin):
+    """Median imputer that safely fills all-NaN columns with 0.0."""
+
+    def fit(self, X, y=None):
+        try:
+            X = pd.DataFrame(X).to_numpy(dtype=np.float64, na_value=np.nan)
+        except Exception:
+            X = np.asarray(X, dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            med = np.nanmedian(X, axis=0)
+        # if a column was all-NaN, nanmedian returns NaN → replace by 0
+        med = np.where(np.isfinite(med), med, 0.0).astype(np.float64)
+        self.fill_ = med
+        return self
+
+    def transform(self, X):
+        try:
+            X = pd.DataFrame(X).to_numpy(dtype=np.float64, na_value=np.nan)
+        except Exception:
+            X = np.asarray(X, dtype=np.float64)
+        # inplace fill using learned medians (or 0.0 for all-NaN columns)
+        mask = ~np.isfinite(X)
+        if np.any(mask):
+            X = X.copy()
+            X[mask] = np.take(self.fill_, np.where(mask)[1])
+        return X
+
+
+class BedConditionalMedianImputer(BaseEstimator, TransformerMixin):
+    """Fill NaNs using per-Bed medians learned on TRAIN; fallback handled by next imputer.
+
+    Designed to work inside ColumnTransformer numeric blocks (numpy arrays), using a
+    fixed bed_index (position of 'Bed' within the numeric block). Clone-safe.
+    """
+
+    def __init__(self, bed_index: int | None = None):
+        self.bed_index = None if bed_index is None else int(bed_index)
+        self.global_medians_: dict[int, float] = {}
+        self.bed_medians_: dict[int, dict[float, float]] = {}
+
+    def fit(self, X, y=None):
+        A = np.asarray(X)
+        if self.bed_index is None or self.bed_index < 0 or self.bed_index >= A.shape[1]:
+            self.global_medians_.clear()
+            self.bed_medians_.clear()
+            return self
+        bed = pd.to_numeric(A[:, self.bed_index], errors="coerce")
+        # Compute global medians and per-bed medians for all columns except bed itself
+        for j in range(A.shape[1]):
+            if j == self.bed_index:
+                continue
+            s = pd.to_numeric(A[:, j], errors="coerce")
+            try:
+                gmed = float(pd.Series(s).median()) if np.isfinite(s).any() else np.nan
+            except Exception:
+                gmed = np.nan
+            self.global_medians_[j] = gmed
+            try:
+                med_by_bed = pd.Series(s).groupby(bed).median()
+                self.bed_medians_[j] = {
+                    float(k): float(v) for k, v in med_by_bed.items() if np.isfinite(v)
+                }
+            except Exception:
+                self.bed_medians_[j] = {}
+        return self
+
+    def transform(self, X):
+        A = np.asarray(X).copy()
+        if self.bed_index is None or self.bed_index < 0 or self.bed_index >= A.shape[1]:
+            return A
+        bed = pd.to_numeric(A[:, self.bed_index], errors="coerce")
+        for j in range(A.shape[1]):
+            if j == self.bed_index:
+                continue
+            s = pd.to_numeric(A[:, j], errors="coerce")
+            if np.isnan(s).any():
+                try:
+                    med_map = self.bed_medians_.get(j, {})
+                    bed_med = bed.map(med_map)
+                    mask = np.isnan(s) & bed_med.notna().to_numpy()
+                    if mask.any():
+                        s[mask] = bed_med.to_numpy()[mask]
+                except Exception:
+                    pass
+            A[:, j] = s
+        return A
 
 
 # ------------------- New schema alias + normalization helpers ------------------- #
 
 # Source-of-truth aliases for new CSV schemas
 _ALIASES = {
-    "target": ["last_rent_price", "last_rental_price", "rent", "weekly_rent", "Last Rental Price", "Rent"],
-    "date_col": ["last_rent_date", "last_rental_date", "date", "Last Rental Date", "Date"],
+    "target": [
+        "last_rent_price",
+        "last_rental_price",
+        "rent",
+        "weekly_rent",
+        "Last Rental Price",
+        "Rent",
+    ],
+    "date_col": [
+        "last_rent_date",
+        "last_rental_date",
+        "date",
+        "Last Rental Date",
+        "Date",
+    ],
     "suburb_col": ["suburb", "locality", "Suburb"],
     "postcode": ["postcode", "post_code", "postal_code", "Postcode"],
     "carparks_total": ["Carparks", "car_parks_total", "carparks", "car"],
@@ -532,8 +1100,17 @@ def _rename_alias_columns(df: pd.DataFrame, alias_map: dict[str, str]) -> pd.Dat
 # ----------------------- Low-entropy categorical guard ------------------------ #
 LOW_ENTROPY_CAT_TOPRATIO = float(os.getenv("LOW_ENTROPY_CAT_TOPRATIO", "0.85"))
 LOW_ENTROPY_MIN_LEVELS = int(os.getenv("LOW_ENTROPY_MIN_LEVELS", "2"))
+# Never drop these categoricals for low-entropy; case-insensitive list
+ALWAYS_KEEP_CATS = tuple(
+    s.strip().lower()
+    for s in os.getenv("ALWAYS_KEEP_CATS", "Pets,Garage").split(",")
+    if s.strip()
+)
 
-def _drop_low_entropy_cats_df(df: pd.DataFrame, cats: list[str]) -> tuple[list[str], list[str]]:
+
+def _drop_low_entropy_cats_df(
+    df: pd.DataFrame, cats: list[str]
+) -> tuple[list[str], list[str]]:
     """Drop categorical columns where the most frequent level dominates (e.g., >85%).
 
     Returns (kept_cats, dropped_cats). Safe for small data; ignores columns not in df.
@@ -542,6 +1119,13 @@ def _drop_low_entropy_cats_df(df: pd.DataFrame, cats: list[str]) -> tuple[list[s
     for c in cats:
         if c not in df.columns:
             continue
+        # Respect keep-list unconditionally
+        try:
+            if str(c).lower() in ALWAYS_KEEP_CATS:
+                kept.append(c)
+                continue
+        except Exception:
+            pass
         ser = df[c].astype("string")
         vc = ser.value_counts(dropna=True)
         if vc.empty:
@@ -549,14 +1133,18 @@ def _drop_low_entropy_cats_df(df: pd.DataFrame, cats: list[str]) -> tuple[list[s
             continue
         top_ratio = float(vc.iloc[0]) / max(1, int(vc.sum()))
         n_levels = int(vc.shape[0])
-        if (n_levels >= LOW_ENTROPY_MIN_LEVELS) and (top_ratio >= LOW_ENTROPY_CAT_TOPRATIO):
+        if (n_levels >= LOW_ENTROPY_MIN_LEVELS) and (
+            top_ratio >= LOW_ENTROPY_CAT_TOPRATIO
+        ):
             dropped.append(c)
         else:
             kept.append(c)
     return kept, dropped
 
 
-def _parse_geo_radii(env_value: str | None, default: Tuple[float, ...]) -> Tuple[float, ...]:
+def _parse_geo_radii(
+    env_value: str | None, default: Tuple[float, ...]
+) -> Tuple[float, ...]:
     if not env_value:
         return default
     try:
@@ -577,7 +1165,9 @@ def _parse_geo_radii(env_value: str | None, default: Tuple[float, ...]) -> Tuple
 def _parse_geo_categories(env_value: str | None) -> Tuple[str, ...] | None:
     if not env_value:
         return None
-    cats = [c.strip() for part in env_value.split(",") for c in part.split(" ") if c.strip()]
+    cats = [
+        c.strip() for part in env_value.split(",") for c in part.split(" ") if c.strip()
+    ]
     cats = [c.upper().replace(" ", "_") for c in cats]
     return tuple(dict.fromkeys(cats)) if cats else None
 
@@ -589,6 +1179,13 @@ def _geo_env_config() -> dict[str, Any] | None:
     config.py (GEO_POI_CSV, GEO_LAT_COL, GEO_LON_COL, GEO_RADII_KM, GEO_DECAY_KM,
     GEO_MAX_DECAY_KM, GEO_CATEGORIES). Returns None if no POI CSV is available.
     """
+    # Hard-off switch: if GEO_FORCE_OFF is set, do not enable or read geo config
+    try:
+        if os.getenv("GEO_FORCE_OFF", "0").lower() in {"1", "true", "yes"}:
+            return None
+    except Exception:
+        # Be conservative; if anything goes wrong evaluating the flag, leave geo off
+        return None
     poi_csv = GEO_POI_CSV
     lat_col = os.getenv("LAT_COL")
     lon_col = os.getenv("LON_COL")
@@ -598,9 +1195,18 @@ def _geo_env_config() -> dict[str, Any] | None:
     cats_env = os.getenv("GEO_CATEGORIES")
 
     # Fallback to config defaults when ENV is empty
-    if not poi_csv or not lat_col or not lon_col or not radii_env or not decay_env or not maxdecay_env or not cats_env:
+    if (
+        not poi_csv
+        or not lat_col
+        or not lon_col
+        or not radii_env
+        or not decay_env
+        or not maxdecay_env
+        or not cats_env
+    ):
         try:
             import config as _cfg_geo  # type: ignore
+
             if not poi_csv:
                 _p = getattr(_cfg_geo, "GEO_POI_CSV", None)
                 if _p and Path(_p).exists():
@@ -629,6 +1235,15 @@ def _geo_env_config() -> dict[str, Any] | None:
         except Exception:
             pass
 
+    # Final fallback: adopt repo default artifacts/poi_christchurch.csv when present
+    if not poi_csv:
+        try:
+            _default_poi = Path("artifacts").joinpath("poi_christchurch.csv")
+            if _default_poi.exists():
+                poi_csv = str(_default_poi)
+        except Exception:
+            pass
+
     if not poi_csv:
         return None
 
@@ -642,17 +1257,21 @@ def _geo_env_config() -> dict[str, Any] | None:
     try:
         max_decay_km = float(maxdecay_env) if maxdecay_env is not None else 3.0
     except Exception:
-        max_decay_km = 3.0
+        max_decay_km = 4.0
     categories = _parse_geo_categories(cats_env)
-    cat_list: list[str] = []
-    if categories:
-        cat_list.extend(categories)
+    # If categories is None -> use all categories present in the CSV (no whitelist).
+    # If categories provided -> enforce required minimum set.
     school_required = ["SCHOOL_HIGH", "SCHOOL_PRIMARY", "SCHOOL_INTERMEDIATE"]
-    poi_required = ["UNIVERSITY"]
-    for cat in poi_required + school_required:
-        if cat not in cat_list:
-            cat_list.append(cat)
-    categories = tuple(cat_list) if cat_list else tuple(poi_required + school_required)
+    # Ensure CBD distance feature is present like UNIVERSITY when a whitelist is used
+    poi_required = ["UNIVERSITY", "CBD"]
+    if categories is None:
+        cats_final = None
+    else:
+        cat_list: list[str] = list(categories)
+        for cat in poi_required + school_required:
+            if cat not in cat_list:
+                cat_list.append(cat)
+        cats_final = tuple(cat_list)
     return {
         "poi_csv": poi_csv,
         "lat_col": lat_col,
@@ -660,14 +1279,16 @@ def _geo_env_config() -> dict[str, Any] | None:
         "radii_km": radii,
         "decay_km": decay_km,
         "max_decay_km": max_decay_km,
-        "categories": categories,
+        "categories": cats_final,
         "include_bearings": GEO_INCLUDE_BEARINGS,
         "use_accessibility": GEO_USE_ACCESSIBILITY,
         "school_mode": GEO_SCHOOL_FEATURE,
     }
 
 
-def _record_removed_rows(tracker: Any, step: str, reference_df: pd.DataFrame, removed_ids: List[int]) -> None:
+def _record_removed_rows(
+    tracker: Any, step: str, reference_df: pd.DataFrame, removed_ids: List[int]
+) -> None:
     if tracker is None or not removed_ids:
         return
     try:
@@ -681,6 +1302,7 @@ def _record_removed_rows(tracker: Any, step: str, reference_df: pd.DataFrame, re
     except Exception as exc:
         logging.debug("RemovedRowsTracker logging failed for step '%s': %s", step, exc)
 
+
 def _pick_first(df_cols: set[str], candidates: list[str]) -> str | None:
     for c in candidates:
         if c in df_cols:
@@ -690,6 +1312,7 @@ def _pick_first(df_cols: set[str], candidates: list[str]) -> str | None:
             if str(dc).lower() == str(c).lower():
                 return dc
     return None
+
 
 def _normalize_new_schema(
     df_in: pd.DataFrame,
@@ -713,8 +1336,13 @@ def _normalize_new_schema(
     """
     df = _rename_alias_columns(df_in, _ALIAS_CANONICAL_MAP)
     cols = set(df.columns)
-    tgt_name = _pick_first(cols, target_preference or _ALIASES["target"]) or "Last Rental Price"
-    dt_name = _pick_first(cols, date_preference or _ALIASES["date_col"]) or "Last Rental Date"
+    tgt_name = (
+        _pick_first(cols, target_preference or _ALIASES["target"])
+        or "Last Rental Price"
+    )
+    dt_name = (
+        _pick_first(cols, date_preference or _ALIASES["date_col"]) or "Last Rental Date"
+    )
     sb_name = _pick_first(cols, suburb_preference or _ALIASES["suburb_col"]) or "Suburb"
 
     # Create canonical columns if not already present
@@ -722,7 +1350,9 @@ def _normalize_new_schema(
         df["Last Rental Price"] = pd.to_numeric(df[tgt_name], errors="coerce")
     if "Last Rental Date" not in df.columns and dt_name in df.columns:
         # dayfirst=True for new CSVs
-        df["Last Rental Date"] = pd.to_datetime(df[dt_name], dayfirst=True, errors="coerce")
+        df["Last Rental Date"] = pd.to_datetime(
+            df[dt_name], dayfirst=True, errors="coerce"
+        )
     if "Suburb" not in df.columns and sb_name in df.columns:
         df["Suburb"] = df[sb_name].astype("string").str.strip().str.upper()
 
@@ -740,15 +1370,25 @@ def _normalize_new_schema(
 
     # Carparks: prefer explicit Car else derive from components
     if "Car" not in df.columns:
-        car_total_col = _pick_first(cols, _ALIASES["carparks_total"])  # may be 'Carparks' or 'car'
+        car_total_col = _pick_first(
+            cols, _ALIASES["carparks_total"]
+        )  # may be 'Carparks' or 'car'
         g_col = _pick_first(cols, _ALIASES["garage_parks"]) or None
         o_col = _pick_first(cols, _ALIASES["offstreet_parks"]) or None
         car = None
         if car_total_col and car_total_col in df.columns:
             car = pd.to_numeric(df[car_total_col], errors="coerce")
         if (g_col and g_col in df.columns) or (o_col and o_col in df.columns):
-            g = pd.to_numeric(df[g_col], errors="coerce") if (g_col and g_col in df.columns) else 0
-            o = pd.to_numeric(df[o_col], errors="coerce") if (o_col and o_col in df.columns) else 0
+            g = (
+                pd.to_numeric(df[g_col], errors="coerce")
+                if (g_col and g_col in df.columns)
+                else 0
+            )
+            o = (
+                pd.to_numeric(df[o_col], errors="coerce")
+                if (o_col and o_col in df.columns)
+                else 0
+            )
             comp = g + o
             car = comp if car is None else np.fmax(car, comp)
         if car is not None:
@@ -756,12 +1396,22 @@ def _normalize_new_schema(
 
     # Sizes (m² -> sqm)
     if "Land Size (sqm)" not in df.columns:
-        for cand in ("land_size (m²)", "land_size (m2)", "Land Size (m�)", "Land Size (sqm)"):
+        for cand in (
+            "land_size (m²)",
+            "land_size (m2)",
+            "Land Size (m�)",
+            "Land Size (sqm)",
+        ):
             if cand in df.columns:
                 df["Land Size (sqm)"] = pd.to_numeric(df[cand], errors="coerce")
                 break
     if "Floor Size (sqm)" not in df.columns:
-        for cand in ("floor_size (m²)", "floor_size (m2)", "Floor Size (m�)", "Floor Size (sqm)"):
+        for cand in (
+            "floor_size (m²)",
+            "floor_size (m2)",
+            "Floor Size (m�)",
+            "Floor Size (sqm)",
+        ):
             if cand in df.columns:
                 df["Floor Size (sqm)"] = pd.to_numeric(df[cand], errors="coerce")
                 break
@@ -794,12 +1444,15 @@ def _normalize_new_schema(
                     .astype("string")
                     .str.strip()
                     .str.lower()
-                    .replace({
-                        r".*apartment.*": "apartment",
-                        r".*unit.*": "unit",
-                        r".*town.*house.*|.*townhouse.*": "townhouse",
-                        r".*house.*": "house",
-                    }, regex=True)
+                    .replace(
+                        {
+                            r".*apartment.*": "apartment",
+                            r".*unit.*": "unit",
+                            r".*town.*house.*|.*townhouse.*": "townhouse",
+                            r".*house.*": "house",
+                        },
+                        regex=True,
+                    )
                 )
                 break
 
@@ -810,7 +1463,16 @@ def _normalize_new_schema(
             df[furn_col]
             .astype("string")
             .str.lower()
-            .replace({"nill": "none", "nil": "none", "none": "none", "partial": "partial", "fully furnished": "full", "full": "full"})
+            .replace(
+                {
+                    "nill": "none",
+                    "nil": "none",
+                    "none": "none",
+                    "partial": "partial",
+                    "fully furnished": "full",
+                    "full": "full",
+                }
+            )
         )
 
     # Days on Market
@@ -823,7 +1485,9 @@ def _normalize_new_schema(
                     p99 = float(np.nanquantile(ser, 0.99))
                 except Exception:
                     p99 = np.nan
-                df["Days on Market"] = ser.clip(lower=0, upper=p99 if np.isfinite(p99) else None)
+                df["Days on Market"] = ser.clip(
+                    lower=0, upper=p99 if np.isfinite(p99) else None
+                )
                 break
 
     # Clamp numeric ranges per spec
@@ -832,9 +1496,13 @@ def _normalize_new_schema(
     if "Bath" in df.columns:
         df["Bath"] = pd.to_numeric(df["Bath"], errors="coerce").clip(lower=0, upper=6)
     if "Year Built" in df.columns:
-        df["Year Built"] = pd.to_numeric(df["Year Built"], errors="coerce").clip(lower=1900, upper=2025)
+        df["Year Built"] = pd.to_numeric(df["Year Built"], errors="coerce").clip(
+            lower=1900, upper=2025
+        )
     if "Last Rental Price" in df.columns:
-        df["Last Rental Price"] = pd.to_numeric(df["Last Rental Price"], errors="coerce").clip(lower=150, upper=2500)
+        df["Last Rental Price"] = pd.to_numeric(
+            df["Last Rental Price"], errors="coerce"
+        ).clip(lower=150, upper=2500)
 
     # Standardize string columns used downstream
     for c in ("Suburb", "Agency", "Agent", "Land Use", "Development Zone", "Category"):
@@ -846,6 +1514,7 @@ def _normalize_new_schema(
 
 
 # ─────────────────────── Numeric robust cleaner ─────────────────────── #
+
 
 class RobustWinsorizer(BaseEstimator, TransformerMixin):
     """Clip numeric features to robust quantile bounds learned on TRAIN only.
@@ -889,6 +1558,7 @@ class RobustWinsorizer(BaseEstimator, TransformerMixin):
 
 
 # ──────────────────────── Outlier Scorer ─────────────────────────── #
+
 
 class OutlierScorer:
     """
@@ -988,7 +1658,9 @@ class OutlierScorer:
         z_resid = np.empty(len(df), dtype=float)
         z_pps = np.full(len(df), np.nan, dtype=float)
 
-        for i, (sub, r, p) in enumerate(zip(df[self.suburb].astype("string"), resid, pps)):
+        for i, (sub, r, p) in enumerate(
+            zip(df[self.suburb].astype("string"), resid, pps)
+        ):
             m_r, s_r = self._stats_resid.get(str(sub), self._global_resid)  # type: ignore
             z_resid[i] = 0.0 if s_r == 0 or not np.isfinite(r) else (r - m_r) / s_r
             if np.isfinite(p):
@@ -996,7 +1668,9 @@ class OutlierScorer:
                     m_p, s_p = self._stats_pps[str(sub)]
                 else:
                     m_p, s_p = self._global_pps if self._global_pps else (0.0, np.nan)
-                z_pps[i] = 0.0 if (not np.isfinite(s_p)) or s_p == 0 else (p - m_p) / s_p
+                z_pps[i] = (
+                    0.0 if (not np.isfinite(s_p)) or s_p == 0 else (p - m_p) / s_p
+                )
 
         flag = (np.abs(z_resid) > self.k_resid) | (np.abs(z_pps) > self.k_pps)
         return pd.DataFrame(
@@ -1027,12 +1701,17 @@ _ORDINAL_MAPS: dict[str, dict[str, int]] = {
     "Kitchen Qual": {"PO": 1, "FA": 2, "TA": 3, "GD": 4, "EX": 5},
 }
 
+
 def _apply_ordinals(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col, mapping in _ORDINAL_MAPS.items():
         if col in out.columns:
             out[col] = (
-                out[col].astype("string", copy=False).str.upper().map(mapping).astype("Int8")
+                out[col]
+                .astype("string", copy=False)
+                .str.upper()
+                .map(mapping)
+                .astype("Int8")
             )
     return out
 
@@ -1088,7 +1767,11 @@ def make_time_features(
     work = df.copy()
     if work.empty or fit_idx.size == 0:
         return work
-    if suburb_col not in work.columns or date_col not in work.columns or target_col not in work.columns:
+    if (
+        suburb_col not in work.columns
+        or date_col not in work.columns
+        or target_col not in work.columns
+    ):
         return work
     if not USE_SUBURB_FEATURES:
         return work
@@ -1114,7 +1797,11 @@ def make_time_features(
         work.assign(_t=t_train)
         .set_index(date_col)
         .groupby(suburb_col)["_t"]
-        .apply(lambda x: _roll_median(x, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_MED_MIN_COUNT))
+        .apply(
+            lambda x: _roll_median(
+                x, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_MED_MIN_COUNT
+            )
+        )
         .rename("Suburb90dMedian")
         .reset_index()
     )
@@ -1129,7 +1816,17 @@ def make_time_features(
                 work.assign(_t=t_train)
                 .set_index(date_col)
                 .groupby(suburb_col)["_t"]
-                .apply(lambda x: pd.to_numeric(x, errors="coerce").sort_index().shift().rolling(f"{SUBURB_MED_WINDOW_DAYS}D", closed="left", min_periods=SUBURB_MED_MIN_COUNT).median())
+                .apply(
+                    lambda x: pd.to_numeric(x, errors="coerce")
+                    .sort_index()
+                    .shift()
+                    .rolling(
+                        f"{SUBURB_MED_WINDOW_DAYS}D",
+                        closed="left",
+                        min_periods=SUBURB_MED_MIN_COUNT,
+                    )
+                    .median()
+                )
                 .rename("Suburb90dMedian_raw")
                 .reset_index()
             )
@@ -1158,8 +1855,12 @@ def make_time_features(
                 .rename("SuburbBed365dMedian")
                 .reset_index()
             )
-            med365_bed = med365_bed.drop_duplicates(subset=[suburb_col, bed_col, date_col], keep="last")
-            work = work.merge(med365_bed, on=[suburb_col, bed_col, date_col], how="left")
+            med365_bed = med365_bed.drop_duplicates(
+                subset=[suburb_col, bed_col, date_col], keep="last"
+            )
+            work = work.merge(
+                med365_bed, on=[suburb_col, bed_col, date_col], how="left"
+            )
 
     # Bed-conditional 90D median per suburb (string-normalized bed)
     if USE_SUBURB_MEDIANS and bed_col in work.columns:
@@ -1168,38 +1869,63 @@ def make_time_features(
             work.assign(_t=t_train)
             .set_index(date_col)
             .groupby([suburb_col, bed_col])["_t"]
-            .apply(lambda x: _roll_median(x, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_BED_MIN_COUNT))
+            .apply(
+                lambda x: _roll_median(
+                    x, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_BED_MIN_COUNT
+                )
+            )
             .rename("SuburbBed90dMedian")
             .reset_index()
         )
         # Guard against duplicate keys causing many-to-many merge explosions
-        med90_bed = med90_bed.drop_duplicates(subset=[suburb_col, bed_col, date_col], keep="last")
+        med90_bed = med90_bed.drop_duplicates(
+            subset=[suburb_col, bed_col, date_col], keep="last"
+        )
         work = work.merge(med90_bed, on=[suburb_col, bed_col, date_col], how="left")
 
     # Bed-normalized floor size ratio to bed-level median floor sqm (TRAIN-only)
     try:
         if bed_col in work.columns and "Floor Size (sqm)" in work.columns:
             tmp = work.loc[fit_idx, [bed_col, "Floor Size (sqm)"]].copy()
-            tmp["Floor Size (sqm)"] = pd.to_numeric(tmp["Floor Size (sqm)"], errors="coerce")
-            bed_med = tmp.groupby(bed_col, dropna=False)["Floor Size (sqm)"].median().to_dict()
+            tmp["Floor Size (sqm)"] = pd.to_numeric(
+                tmp["Floor Size (sqm)"], errors="coerce"
+            )
+            bed_med = (
+                tmp.groupby(bed_col, dropna=False)["Floor Size (sqm)"]
+                .median()
+                .to_dict()
+            )
             bed_series = work[bed_col].astype("string")
             med_series = bed_series.map(bed_med)
             flr = pd.to_numeric(work["Floor Size (sqm)"], errors="coerce")
-            work["floor_to_bed_med"] = (flr / pd.to_numeric(med_series, errors="coerce").replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            work["floor_to_bed_med"] = (
+                flr / pd.to_numeric(med_series, errors="coerce").replace(0, np.nan)
+            ).replace([np.inf, -np.inf], np.nan)
             work["floor_to_bed_med"] = work["floor_to_bed_med"].fillna(1.0)
     except Exception as e:
         logging.warning("floor_to_bed_med computation failed: %s", e)
 
     # LOO encoders trained on TRAIN only, applied to all rows (enabled via env)
-    if USE_SUBURB_LOO and os.getenv("DISABLE_LOO", "0").lower() not in {"1", "true", "yes"} and SuburbLOOEncoder is not None:
-        enc_sub = SuburbLOOEncoder(col=suburb_col, sigma=0.1, random_state=RANDOM_STATE)
-        enc_sm = SuburbMonthLOOEncoder(
-            suburb_col=suburb_col, date_col=date_col, sigma=0.1, random_state=RANDOM_STATE
-        )
+    if (
+        USE_SUBURB_LOO
+        and os.getenv("DISABLE_LOO", "0").lower() not in {"1", "true", "yes"}
+        and SuburbLOOEncoder is not None
+    ):
+        # Native encoders: leakage-safe generation for FULL dataset
+        _k = float(os.getenv("LOO_SMOOTH_K", "10.0"))
+        enc_sub = SuburbLOOEncoder(col=suburb_col, k=_k)
+        enc_sm = SuburbMonthLOOEncoder(suburb_col=suburb_col, date_col=date_col, k=_k)
         enc_sub.fit(work.loc[fit_idx][[suburb_col]], work.loc[fit_idx][target_col])
-        enc_sm.fit(work.loc[fit_idx][[suburb_col, date_col]], work.loc[fit_idx][target_col])
-        work["Suburb_LOO"] = enc_sub.transform(work[[suburb_col]])[f"{suburb_col}_LOO"].values
-        work["SuburbMonth_LOO"] = enc_sm.transform(work[[suburb_col, date_col]])["SuburbMonth_LOO"].values
+        enc_sm.fit(
+            work.loc[fit_idx][[suburb_col, date_col]], work.loc[fit_idx][target_col]
+        )
+        train_mask = work.index.isin(work.index[fit_idx]).to_numpy()
+        work["Suburb_LOO"] = enc_sub.transform_all(
+            work[[suburb_col]], work[target_col], train_mask
+        )
+        work["SuburbMonth_LOO"] = enc_sm.transform_all(
+            work[[suburb_col, date_col]], work[target_col], train_mask
+        )
 
     # Optional monthly ranking transformer
     if USE_SUBURB_RANK and MonthlyRankingTransformer is not None:
@@ -1216,7 +1942,137 @@ def make_time_features(
     return work
 
 
+# --- NEW: Recency v2 anchors (as-of rolling medians + momentum) ---
+def add_rec2_features(
+    df: pd.DataFrame,
+    fit_idx: np.ndarray,
+    *,
+    date_col: str,
+    target_col: str,
+    suburb_col: str,
+    bed_col: str = "Bed",
+) -> pd.DataFrame:
+    """Add rec2_* features computed as-of using TRAIN-only history.
+
+    - Suburb medians over 30/90/180/365 days (closed='left')
+    - Suburb×Bed medians over 30/90/180/365 (closed='left')
+    - Momentum ratios 30/365 and 90/365 for both granularities
+    """
+    try:
+        work = df.copy()
+        if work.empty or fit_idx.size == 0:
+            return work
+        if (
+            suburb_col not in work.columns
+            or date_col not in work.columns
+            or target_col not in work.columns
+        ):
+            return work
+        # Ensure datetime indexability and stable types
+        try:
+            work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        except Exception:
+            pass
+        # TRAIN-only values for rolling target
+        mask = np.zeros(len(work), dtype=bool)
+        valid_idx = fit_idx[(fit_idx >= 0) & (fit_idx < len(work))]
+        if valid_idx.size == 0:
+            return work
+        mask[valid_idx] = True
+        t_train = work[target_col].where(pd.Series(mask, index=work.index), np.nan)
+        work[bed_col] = work.get(bed_col, np.nan).astype("string")
+        # Build grouped time series
+        base = work.assign(_t=t_train).set_index(date_col)
+
+        def _med(g: pd.Series, win: str, min_ct: int = 1) -> pd.Series:
+            v = pd.to_numeric(g, errors="coerce").sort_index()
+            return v.shift().rolling(win, closed="left", min_periods=min_ct).median()
+
+        # Suburb medians
+        med_sub = {}
+        for w in ("30D", "90D", "180D", "365D"):
+            m = (
+                base.groupby(suburb_col)["_t"]
+                .apply(lambda s: _med(s, w))
+                .rename(f"rec2_suburb_med_{w[:-1]}d")
+                .reset_index()
+            )
+            med_sub[w] = m
+        for w, m in med_sub.items():
+            col = f"rec2_suburb_med_{w[:-1]}d"
+            if suburb_col in m.columns and date_col in m.columns:
+                m = m.drop_duplicates(subset=[suburb_col, date_col], keep="last")
+                work = work.merge(m, on=[suburb_col, date_col], how="left")
+        # Suburb×Bed medians
+        med_sb = {}
+        gb_cols = [suburb_col, bed_col]
+        for w in ("30D", "90D", "180D", "365D"):
+            m = (
+                base.groupby(gb_cols)["_t"]
+                .apply(lambda s: _med(s, w))
+                .rename(f"rec2_suburbbed_med_{w[:-1]}d")
+                .reset_index()
+            )
+            med_sb[w] = m
+        for w, m in med_sb.items():
+            col = f"rec2_suburbbed_med_{w[:-1]}d"
+            if all(c in m.columns for c in (*gb_cols, date_col)):
+                m = m.drop_duplicates(subset=[*gb_cols, date_col], keep="last")
+                work = work.merge(m, on=[*gb_cols, date_col], how="left")
+        # Momentum ratios (guard against /0)
+        with np.errstate(all="ignore"):
+            if (
+                "rec2_suburb_med_30d" in work.columns
+                and "rec2_suburb_med_365d" in work.columns
+            ):
+                work["rec2_mom_suburb_30_365"] = pd.to_numeric(
+                    work["rec2_suburb_med_30d"], errors="coerce"
+                ) / pd.to_numeric(
+                    work["rec2_suburb_med_365d"], errors="coerce"
+                ).replace(
+                    0, np.nan
+                )
+            if (
+                "rec2_suburb_med_90d" in work.columns
+                and "rec2_suburb_med_365d" in work.columns
+            ):
+                work["rec2_mom_suburb_90_365"] = pd.to_numeric(
+                    work["rec2_suburb_med_90d"], errors="coerce"
+                ) / pd.to_numeric(
+                    work["rec2_suburb_med_365d"], errors="coerce"
+                ).replace(
+                    0, np.nan
+                )
+            if (
+                "rec2_suburbbed_med_30d" in work.columns
+                and "rec2_suburbbed_med_365d" in work.columns
+            ):
+                work["rec2_mom_suburbbed_30_365"] = pd.to_numeric(
+                    work["rec2_suburbbed_med_30d"], errors="coerce"
+                ) / pd.to_numeric(
+                    work["rec2_suburbbed_med_365d"], errors="coerce"
+                ).replace(
+                    0, np.nan
+                )
+            if (
+                "rec2_suburbbed_med_90d" in work.columns
+                and "rec2_suburbbed_med_365d" in work.columns
+            ):
+                work["rec2_mom_suburbbed_90_365"] = pd.to_numeric(
+                    work["rec2_suburbbed_med_90d"], errors="coerce"
+                ) / pd.to_numeric(
+                    work["rec2_suburbbed_med_365d"], errors="coerce"
+                ).replace(
+                    0, np.nan
+                )
+        return work
+    except Exception as e:
+        logging.warning("add_rec2_features failed: %s", e)
+        return df
+
+
 # ───────────────────────────── Preprocessor ───────────────────────────── #
+
 
 def build_preprocessor(
     df_train: pd.DataFrame,
@@ -1226,7 +2082,29 @@ def build_preprocessor(
     *,
     date_col: str,
 ) -> Tuple[ColumnTransformer, List[int]]:
-    num_steps: list = [("winsor", RobustWinsorizer(lower_q=float(os.getenv("WINSOR_LO", "0.02")), upper_q=float(os.getenv("WINSOR_HI", "0.98")))), ("imp", SimpleImputer(strategy="median"))]
+    # Ensure 'Bed' is in the numeric block so per-Bed imputer can operate deterministically,
+    # even if the raw column arrives as categorical in some datasets.
+    bed_index = None
+    if "Bed" in df_train.columns:
+        try:
+            if "Bed" not in numeric_cols:
+                numeric_cols = list(numeric_cols) + ["Bed"]
+            bed_index = list(numeric_cols).index("Bed")
+        except Exception:
+            # Fallback: keep bed_index=None (SafeMedianImputer will still guard all-NaN columns)
+            bed_index = None
+    # Use BedConditionalMedianImputer before SafeMedianImputer for leak-safe per-Bed imputations
+    num_steps: list = [
+        (
+            "clip",
+            RobustWinsorizer(
+                lower_q=float(os.getenv("WINSOR_LO", "0.02")),
+                upper_q=float(os.getenv("WINSOR_HI", "0.98")),
+            ),
+        ),
+        ("bed_impute", BedConditionalMedianImputer(bed_index=bed_index)),
+        ("impute", SafeMedianImputer()),
+    ]
     if scale_numeric:
         num_steps.append(("scaler", StandardScaler()))
     num_pipe = Pipeline(num_steps)
@@ -1251,20 +2129,26 @@ def build_preprocessor(
     # Base column transformer
     base_ct = ColumnTransformer(transformers, remainder="drop", sparse_threshold=0.0)
     # Wrap with a pre-input adapter so serve-time reproduces train feature columns
-    preproc = Pipeline([
-        ("preinput", PreInputAdapter(date_col=date_col)),
-        ("ct", base_ct),
-    ])
+    preproc = Pipeline(
+        [
+            ("preinput", PreInputAdapter(date_col=date_col)),
+            ("ct", base_ct),
+        ]
+    )
     n_num = len(numeric_cols)
     cat_idx = list(range(n_num, n_num + len(categorical_cols)))
     return preproc, cat_idx
 
 
-
 def _clip_cat_indices(cat_idx: List[int], n_features: int) -> List[int]:
     clipped = [idx for idx in cat_idx if 0 <= idx < n_features]
     if len(clipped) != len(cat_idx):
-        logging.warning("Adjusted cat feature indices from %s to %s (n_features=%d)", cat_idx, clipped, n_features)
+        logging.warning(
+            "Adjusted cat feature indices from %s to %s (n_features=%d)",
+            cat_idx,
+            clipped,
+            n_features,
+        )
     return clipped
 
 
@@ -1290,22 +2174,184 @@ def _expand_cat_indices_for_strings(X: np.ndarray, cat_idx: List[int]) -> List[i
         return cat_idx
     expanded = sorted(new_idx)
     if expanded != sorted(cat_idx):
-        logging.warning("Expanded cat feature indices from %s to %s based on detected string columns", cat_idx, expanded)
+        logging.warning(
+            "Expanded cat feature indices from %s to %s based on detected string columns",
+            cat_idx,
+            expanded,
+        )
     return expanded
+
+
+# ───────────────────────── Unified Ridge builder (DataFrame → preproc → encode) ───────────────────────── #
+def _build_ridge_with_preproc(
+    *, preproc: Pipeline, alpha: float | None = None
+) -> Pipeline:
+    """
+    DF → (clone of CatBoost preproc) → AutoOrdinalOnObjects → SafeMedianImputer → MaxAbsScaler → TTR(Ridge)
+    This removes the need to track post-preproc categorical indices and hardens against schema drift.
+    """
+    preproc_clone = deepcopy(preproc)
+    alpha_val = (
+        float(os.getenv("RIDGE_ALPHA", "3.0")) if alpha is None else float(alpha)
+    )
+    base = Ridge(alpha=alpha_val, random_state=RANDOM_STATE)
+    ttr = TransformedTargetRegressor(
+        regressor=base, func=_ttr_log1p_clip, inverse_func=_safe_expm1
+    )
+    return Pipeline(
+        steps=[
+            ("preprocessor", preproc_clone),
+            ("auto_ordinal", AutoOrdinalOnObjects(unknown_value=-1)),
+            ("impute_all", SafeMedianImputer()),
+            ("scale", MaxAbsScaler()),
+            ("model", ttr),
+        ]
+    )
+
+
+# (legacy matrix-in Ridge builder removed; DF-in only)
 
 
 # ───────────────────────────── CV helpers ───────────────────────────── #
 
+
 def make_block_labels(dates: pd.Series, freq: str = "M") -> np.ndarray:
     return (
-        pd.to_datetime(dates)
-        .dt.to_period(freq)
-        .astype("int64", copy=False)
-        .to_numpy()
+        pd.to_datetime(dates).dt.to_period(freq).astype("int64", copy=False).to_numpy()
     )
 
+
+# -------------------- Removed-rows tracker for audit exports -------------------- #
+class _RemovedRowsCollector:
+    def __init__(self) -> None:
+        self._rows: list[pd.DataFrame] = []
+
+    def track_ids(self, ids: list[int], reference_df: pd.DataFrame, step: str) -> None:
+        if not ids:
+            return
+        cols = [
+            c
+            for c in [
+                "__row_id",
+                "Suburb",
+                "Last Rental Date",
+                "Last Rental Price",
+                "Bed",
+                "Bath",
+                "Car",
+            ]
+            if c in reference_df.columns
+        ]
+        df = reference_df.loc[
+            reference_df.get("__row_id", pd.Series([], dtype=int)).isin(ids), cols
+        ].copy()
+        df["__removed_step"] = step
+        self._rows.append(df)
+
+    def track(
+        self, before_df: pd.DataFrame, remaining_df: pd.DataFrame, step: str
+    ) -> None:
+        # Fallback when explicit ids are unavailable
+        try:
+            if "__row_id" in before_df.columns and "__row_id" in remaining_df.columns:
+                keep = set(remaining_df["__row_id"].astype(int).tolist())
+                gone = before_df.loc[
+                    ~before_df["__row_id"].astype(int).isin(keep)
+                ].copy()
+            else:
+                gone = before_df.loc[~before_df.index.isin(remaining_df.index)].copy()
+            cols = [
+                c
+                for c in [
+                    "__row_id",
+                    "Suburb",
+                    "Last Rental Date",
+                    "Last Rental Price",
+                    "Bed",
+                    "Bath",
+                    "Car",
+                ]
+                if c in gone.columns
+            ]
+            df = gone[cols].copy()
+            df["__removed_step"] = step
+            self._rows.append(df)
+        except Exception:
+            pass
+
+    def export_csv(self, path: Path) -> Path | None:
+        try:
+            if not self._rows:
+                return None
+            out = pd.concat(self._rows, axis=0, ignore_index=True)
+            out.to_csv(path, index=False)
+            return path
+        except Exception:
+            return None
+
+
+# --- helper: ames-style kfold iterator (keeps rentals time-aware by default) ---
+def _cv_iter_ames_kfold(n_samples: int, *, n_splits: int, seed: int):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    idx = np.arange(n_samples, dtype=int)
+    for tr, va in kf.split(idx):
+        yield tr.astype(int), va.astype(int)
+
+
+# --- helper: fit non-negative blend weights on OOF matrix ---
+def _fit_blend_head_nnls(
+    oof_matrix: np.ndarray,
+    y_true: np.ndarray,
+    labels: list[str],
+    sample_weights: np.ndarray | None = None,
+) -> dict | None:
+    if oof_matrix is None or np.size(oof_matrix) == 0:
+        return None
+
+    X = np.asarray(oof_matrix, float)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+
+    y = np.asarray(y_true, float).reshape(-1)
+    # Optional row weighting (approximate wMAE preferences via weighted L2)
+    if sample_weights is not None:
+        try:
+            sw = np.asarray(sample_weights, float).reshape(-1)
+            sw = np.sqrt(np.clip(sw, 1e-12, None))
+            if sw.shape[0] == X.shape[0]:
+                X = X * sw[:, None]
+                y = y * sw
+        except Exception:
+            pass
+    if _nnls is None:
+        # Neutral fallback (CatBoost only)
+        w = np.zeros(X.shape[1], float)
+        w[0] = 1.0
+        return {
+            "weights": w.tolist(),
+            "labels": list(labels),
+            "objective": "L2",
+            "solver": "skip",
+        }
+
+    w, _ = _nnls(X, y)
+    s = float(w.sum()) or 1.0
+    w = (w / s).astype(float)
+    return {
+        "weights": w.tolist(),
+        "labels": list(labels),
+        "objective": "L2",
+        "solver": "nnls",
+    }
+
+
 # --- NEW: metric and small utilities ---
-def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray | None = None, eps: float = 1e-6) -> float:
+def _safe_mape(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    w: np.ndarray | None = None,
+    eps: float = 1e-6,
+) -> float:
     denom = np.maximum(np.abs(y_true), eps)
     err = np.abs((y_true - y_pred) / denom)
     try:
@@ -1313,9 +2359,11 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray, w: np.ndarray | None = No
     except Exception:
         return float(np.mean(err))
 
+
 def _drop_raw_date_from_cats(cat_cols: list[str], date_col: str) -> list[str]:
     date_like = {str(date_col), "Valuation Date", "Last Rental Date"}
     return [c for c in cat_cols if c not in date_like]
+
 
 # --- NEW: deterministic month-based holdout ---
 def split_holdout_by_months(
@@ -1324,12 +2372,33 @@ def split_holdout_by_months(
     labels = make_block_labels(dates, "M")
     uniq = np.sort(np.unique(labels))
     if len(uniq) < (test_months + early_months + max(gap_months, 0) + 1):
-        # Not enough months: let legacy fallback handle
-        return (np.arange(len(dates)), np.array([], int), np.array([], int))
+        # Not enough months: dynamic fallback to stable 2M TEST / 1M EARLY, no embargo
+        n_months = len(uniq)
+        t_m = min(2, max(1, n_months // 4)) if n_months >= 2 else 1
+        e_m = 1 if n_months - t_m >= 2 else max(0, min(1, n_months - t_m - 1))
+        test_lbls = uniq[-t_m:]
+        early_lbls = (
+            uniq[-(t_m + e_m) : -t_m] if e_m > 0 else np.array([], dtype=uniq.dtype)
+        )
+        train_lbls = (
+            uniq[: -(t_m + e_m)]
+            if (t_m + e_m) < n_months
+            else np.array([], dtype=uniq.dtype)
+        )
+        idx = np.arange(len(dates))
+        return (
+            idx[np.isin(labels, train_lbls)],
+            idx[np.isin(labels, early_lbls)],
+            idx[np.isin(labels, test_lbls)],
+        )
     test_lbls = uniq[-test_months:]
     early_end = -test_months
     early_start = early_end - early_months
-    early_lbls = uniq[early_start:early_end] if early_months > 0 else np.array([], dtype=uniq.dtype)
+    early_lbls = (
+        uniq[early_start:early_end]
+        if early_months > 0
+        else np.array([], dtype=uniq.dtype)
+    )
     train_hi = early_start - max(gap_months, 0)
     # Support negative slicing semantics to drop last months
     if train_hi == 0:
@@ -1342,6 +2411,7 @@ def split_holdout_by_months(
         idx[np.isin(labels, early_lbls)],
         idx[np.isin(labels, test_lbls)],
     )
+
 
 # --- NEW: optional geo enrichment hook ---
 
@@ -1387,14 +2457,85 @@ def _try_add_geo_features(df: pd.DataFrame) -> pd.DataFrame:
         logging.warning("Geo features skipped: %s", e)
         return df
 
+
+# --- NEW: stable group id helper for grouped blocking ---
+def _stable_group_id(
+    df: pd.DataFrame,
+    suburb_col: str,
+    *,
+    lat_col_candidates: tuple[str, ...] = ("Latitude", "latitude", "lat"),
+    lon_col_candidates: tuple[str, ...] = ("Longitude", "longitude", "lon", "lng"),
+) -> pd.Series:
+    """Return a stable group identifier per row to block near-duplicate leakage.
+
+    Prefers suburb + normalized address (digits preserved). Falls back to rounded lat/lon (4 d.p.).
+    """
+    try:
+        sub = df.get(suburb_col)
+        if sub is None:
+            sub = pd.Series(["" for _ in range(len(df))], index=df.index)
+        sub = sub.astype("string").fillna("")
+        addr_col = None
+        for cand in (
+            "Address",
+            "Street Address",
+            "street_address",
+            "Full_Address",
+            "full_address",
+            "property_id",
+        ):
+            if cand in df.columns:
+                addr_col = cand
+                break
+        if addr_col is not None:
+            raw = df[addr_col].astype("string").fillna("")
+            # Uppercase, remove non-alnum except keep digits; collapse spaces
+            norm = raw.str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+            return (sub.str.upper() + "|" + norm).astype("string")
+        # Fallback: rounded lat/lon
+        lat = None
+        lon = None
+        for lc in lat_col_candidates:
+            if lc in df.columns:
+                lat = pd.to_numeric(df[lc], errors="coerce")
+                break
+        for lc in lon_col_candidates:
+            if lc in df.columns:
+                lon = pd.to_numeric(df[lc], errors="coerce")
+                break
+        if lat is not None and lon is not None:
+            key = (
+                sub.str.upper()
+                + "|LAT"
+                + lat.round(4).astype("string")
+                + ":LON"
+                + lon.round(4).astype("string")
+            )
+            return key.astype("string")
+    except Exception:
+        pass
+    # Final fallback: just suburb
+    try:
+        return (
+            df.get(suburb_col, pd.Series(["" for _ in range(len(df))], index=df.index))
+            .astype("string")
+            .fillna("")
+        )
+    except Exception:
+        return pd.Series(["" for _ in range(len(df))], index=df.index, dtype="string")
+
+
 # --- NEW: conformalized quantile regression helper ---
-def _cqr_qhat(y_true: np.ndarray, q_lo: np.ndarray, q_hi: np.ndarray, alpha: float) -> float:
+def _cqr_qhat(
+    y_true: np.ndarray, q_lo: np.ndarray, q_hi: np.ndarray, alpha: float
+) -> float:
     s = np.maximum(q_lo - y_true, y_true - q_hi)
     s = np.maximum(s, 0.0)
     s = s[np.isfinite(s)]
     if s.size == 0:
         return 0.0
     return float(np.quantile(s, 1.0 - alpha))
+
 
 # --- NEW: median-blend helper (EARLY-tuned lambda only) ---
 def _apply_median_blend(
@@ -1426,55 +2567,44 @@ def _apply_median_blend(
     base_w = float(np.sum(w_test * np.abs(y_test - y_pred_test)) / np.sum(w_test))
     return y_pred_test, best_lam, base_w
 
-_adv_rs = np.random.RandomState(42)
-def _adversarial_auc(X_train, X_early, X_test) -> float:
-    """Fast LR AUC probe with optional row cap to keep runtime bounded."""
-    def _to_numeric_dense(block):
-        if sp.issparse(block):
-            try:
-                return block.astype(np.float32).toarray()
-            except Exception:
-                block = block.toarray()
-        arr = np.asarray(block)
-        if arr.dtype.kind in {"O", "U", "S"}:
-            df = pd.DataFrame(arr)
-            for col in df.columns:
-                if not pd.api.types.is_numeric_dtype(df[col]):
-                    df[col] = pd.Categorical(df[col]).codes.astype(np.float32)
-                else:
-                    df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
-            arr = df.to_numpy(dtype=np.float32)
-        else:
-            arr = arr.astype(np.float32, copy=False)
-        return arr
 
-    Xt = _to_numeric_dense(X_train)
-    Xe = _to_numeric_dense(X_early)
-    Xs = _to_numeric_dense(X_test)
-    # Build ADV matrix
-    X_adv = sp.vstack([Xt, Xe, Xs]) if sp.issparse(Xt) else np.vstack([Xt, Xe, Xs])
-    y_adv = np.concatenate([np.zeros(Xt.shape[0] + Xe.shape[0], dtype=int), np.ones(Xs.shape[0], dtype=int)])
-    # Optional subsample
-    n = X_adv.shape[0]
-    if n > ADV_MAX_ROWS > 0:
-        n_tr, n_ea, n_te = Xt.shape[0], Xe.shape[0], Xs.shape[0]
-        def take(k, want):
-            idx = np.arange(k)
-            return idx if k <= want else _adv_rs.choice(idx, size=want, replace=False)
-        want_tr = max(1, int(ADV_MAX_ROWS * (n_tr / n)))
-        want_ea = max(0, int(ADV_MAX_ROWS * (n_ea / n)))
-        want_te = max(1, int(ADV_MAX_ROWS - want_tr - want_ea))
-        tr_idx = take(n_tr, want_tr)
-        ea_idx = take(n_ea, want_ea)
-        te_idx = take(n_te, want_te)
-        X_adv = (sp.vstack([Xt[tr_idx], Xe[ea_idx], Xs[te_idx]]) if sp.issparse(Xt)
-                 else np.vstack([Xt[tr_idx], Xe[ea_idx], Xs[te_idx]]))
-        y_adv = np.concatenate([np.zeros(len(tr_idx) + len(ea_idx), dtype=int), np.ones(len(te_idx), dtype=int)])
-    # Faster convergence settings
-    clf = LogisticRegression(max_iter=5000, tol=1e-3, solver="lbfgs")
+_adv_rs = np.random.RandomState(42)
+
+
+def _adversarial_auc(X_train, X_early, X_test) -> float:
+    """Fast LR AUC probe with robust numeric coercion and optional row cap."""
+    # Coerce to dense numeric (strings -> categorical codes, NaNs -> 0)
+    Xt = _coerce_for_adv_lr(X_train)
+    Xe = _coerce_for_adv_lr(X_early)
+    Xs = _coerce_for_adv_lr(X_test)
+    X_teach = np.vstack([Xt, Xe])
+    X_adv = np.vstack([X_teach, Xs])
+    y_adv = np.concatenate(
+        [np.zeros(X_teach.shape[0], dtype=int), np.ones(Xs.shape[0], dtype=int)]
+    )
+    # Optional subsample to keep runtime bounded
+    n_all = X_adv.shape[0]
+    if n_all > ADV_MAX_ROWS > 0:
+        n_teach = X_teach.shape[0]
+        n_test = Xs.shape[0]
+        want_teach = max(2, int(ADV_MAX_ROWS * (n_teach / n_all)))
+        want_test = max(2, int(ADV_MAX_ROWS - want_teach))
+        rs = np.random.RandomState(42)
+        idx_teach = rs.choice(
+            np.arange(n_teach), size=min(want_teach, n_teach), replace=False
+        )
+        idx_test = rs.choice(
+            np.arange(n_test), size=min(want_test, n_test), replace=False
+        )
+        X_adv = np.vstack([X_teach[idx_teach], Xs[idx_test]])
+        y_adv = np.concatenate(
+            [np.zeros(len(idx_teach), dtype=int), np.ones(len(idx_test), dtype=int)]
+        )
+    clf = LogisticRegression(max_iter=1000, tol=1e-3, solver="lbfgs")
     clf.fit(X_adv, y_adv)
     p = clf.predict_proba(X_adv)[:, 1]
     return float(roc_auc_score(y_adv, p))
+
 
 def _adversarial_auc_and_weights(X_train, X_early, X_test):
     """Robust adversarial classifier on preprocessed features.
@@ -1511,50 +2641,112 @@ def _adversarial_auc_and_weights(X_train, X_early, X_test):
     w_ea = iw[n_tr:] if n_ea else np.empty((0,), dtype=np.float32)
     return auc, w_tr, w_ea
 
+
 # --- NEW: density-ratio via fast domain classifier (for importance weighting) ---
 def _domain_importance_weights(
-    X_train, X_early, X_test, *, clip: tuple[float, float] = (0.2, 5.0), temperature: float = 1.0
+    X_train,
+    X_early,
+    X_test,
+    *,
+    clip: tuple[float, float] = (0.2, 5.0),
+    temperature: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Train a quick domain classifier (TRAIN+EARLY vs TEST) and return per-row weights for TRAIN and EARLY:
       w = (p_test / (1 - p_test)) ** (1/temperature), clipped to [clip_low, clip_high]
     """
     # Ensure numeric arrays (dense or sparse) to avoid string conversion errors
-    Xt = _coerce_for_adv_lr(X_train)
-    Xe = _coerce_for_adv_lr(X_early)
-    Xs = _coerce_for_adv_lr(X_test)
-    X_teach = sp.vstack([Xt, Xe]) if sp.issparse(Xt) else np.vstack([Xt, Xe])
-    X_all = sp.vstack([X_teach, Xs]) if sp.issparse(Xt) else np.vstack([X_teach, Xs])
-    y_all = np.concatenate([np.zeros(X_teach.shape[0], dtype=int), np.ones(X_test.shape[0], dtype=int)])
+    Xt = np.asarray(_coerce_for_adv_lr(X_train), dtype=np.float32)
+    Xe = np.asarray(_coerce_for_adv_lr(X_early), dtype=np.float32)
+    Xs = np.asarray(_coerce_for_adv_lr(X_test), dtype=np.float32)
+
+    if Xt.ndim != 2 or Xs.ndim != 2 or (Xe.ndim and Xe.ndim != 2):
+        raise ValueError("Importance weighting expects 2D feature arrays.")
+
+    teach_parts = [Xt]
+    if Xe.size:
+        teach_parts.append(Xe)
+    X_teach = np.vstack(teach_parts) if len(teach_parts) > 1 else teach_parts[0]
+    X_all = np.vstack([X_teach, Xs])
+    y_all = np.concatenate(
+        [np.zeros(X_teach.shape[0], dtype=int), np.ones(Xs.shape[0], dtype=int)]
+    )
     # Optional subsample for IW to keep runtime bounded
     n_all = X_all.shape[0]
     if n_all > IW_MAX_ROWS > 0:
         n_teach = X_teach.shape[0]
-        n_test = X_test.shape[0]
+        n_test = Xs.shape[0]
         want_teach = max(2, int(IW_MAX_ROWS * (n_teach / n_all)))
         want_test = max(2, int(IW_MAX_ROWS - want_teach))
         rs = np.random.RandomState(42)
-        idx_teach = rs.choice(np.arange(n_teach), size=want_teach, replace=False) if n_teach > want_teach else np.arange(n_teach)
-        idx_test = rs.choice(np.arange(n_test), size=want_test, replace=False) if n_test > want_test else np.arange(n_test)
-        X_all = (sp.vstack([X_teach[idx_teach], X_test[idx_test]]) if sp.issparse(X_all)
-                 else np.vstack([X_teach[idx_teach], X_test[idx_test]]))
-        y_all = np.concatenate([np.zeros(len(idx_teach), dtype=int), np.ones(len(idx_test), dtype=int)])
+        idx_teach = (
+            rs.choice(np.arange(n_teach), size=want_teach, replace=False)
+            if n_teach > want_teach
+            else np.arange(n_teach)
+        )
+        idx_test = (
+            rs.choice(np.arange(n_test), size=want_test, replace=False)
+            if n_test > want_test
+            else np.arange(n_test)
+        )
+        X_all = np.vstack([X_teach[idx_teach], Xs[idx_test]])
+        y_all = np.concatenate(
+            [np.zeros(len(idx_teach), dtype=int), np.ones(len(idx_test), dtype=int)]
+        )
     clf = SGDClassifier(
-        loss="log_loss", alpha=1e-4, penalty="l2",
-        max_iter=800, early_stopping=True, n_iter_no_change=3, random_state=RANDOM_STATE
+        loss="log_loss",
+        alpha=1e-4,
+        penalty="l2",
+        max_iter=800,
+        early_stopping=True,
+        n_iter_no_change=3,
+        random_state=RANDOM_STATE,
     )
-    clf.fit(X_all, y_all)
-    p = clf.predict_proba(X_teach)[:, 1]
+    clf.fit(X_all.astype(np.float32, copy=False), y_all)
+    p = clf.predict_proba(X_teach.astype(np.float32, copy=False))[:, 1]
     p = np.clip(p, 1e-6, 1 - 1e-6)
     if temperature and temperature != 1.0:
         logit = np.log(p / (1 - p)) / float(temperature)
         p = 1.0 / (1.0 + np.exp(-logit))
     w = p / (1.0 - p)
-    w = np.clip(w.astype(np.float64), float(clip[0]), float(clip[1]))
-    return w[: X_train.shape[0]], w[X_train.shape[0] :]
+    w = np.clip(w.astype(np.float64, copy=False), float(clip[0]), float(clip[1]))
+    n_train = Xt.shape[0]
+    n_early = Xe.shape[0]
+    w_teach = w[:n_train].astype(np.float32, copy=False)
+    if n_early:
+        w_early = w[n_train : n_train + n_early].astype(np.float32, copy=False)
+    else:
+        w_early = np.empty((0,), dtype=np.float32)
+    return w_teach, w_early
 
 
-def monte_carlo_block_splits(labels: np.ndarray) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
+def _rescale_importance_weights(
+    weights: np.ndarray, *, clip: tuple[float, float], temperature: float
+) -> np.ndarray:
+    """Apply optional temperature scaling and clipping to raw density-ratio weights."""
+    if weights is None:
+        return np.empty((0,), dtype=np.float32)
+    w = np.asarray(weights, dtype=np.float64)
+    if w.size == 0:
+        return w.astype(np.float32, copy=False)
+    w = np.clip(w, 1e-6, np.inf)
+    if temperature and temperature != 1.0:
+        p = np.clip(w / (1.0 + w), 1e-6, 1 - 1e-6)
+        logit = np.log(p / (1.0 - p)) / float(temperature)
+        p = 1.0 / (1.0 + np.exp(-logit))
+        w = p / (1.0 - p)
+    low, high = float(clip[0]), float(clip[1])
+    if not np.isfinite(low):
+        low = 0.0
+    if not np.isfinite(high):
+        high = np.inf
+    w = np.clip(w, low, high)
+    return w.astype(np.float32, copy=False)
+
+
+def monte_carlo_block_splits(
+    labels: np.ndarray,
+) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
     rng = np.random.default_rng(RANDOM_STATE)
     uniq = np.unique(labels)
     n_val_blocks = max(1, int(len(uniq) * BLOCK_VAL_PCT))
@@ -1637,37 +2829,73 @@ def purge_groups(
 
 _HELPER_LEAKS = {"_log_rent", "_log_cap", "rent_shift", "rent_copy"}
 
+
 def make_leak_checker(target_col: str) -> Callable[[str], bool]:
     tgt_re = re.compile(rf"\b{re.escape(target_col.lower())}\b", flags=re.I)
+
     def _leaks(col: str) -> bool:
         name = col.lower()
         return name in _HELPER_LEAKS or tgt_re.search(name) is not None
+
     return _leaks
 
 
 # ─────────────────────────── Utilities ─────────────────────────── #
 
+
 def _safe_expm1(x: np.ndarray | float) -> np.ndarray | float:
     return np.expm1(np.clip(x, None, 40.0))  # e^40 ~ 2.35e17
-# Helper: Top-K numeric selection via mutual information with log target, with correlation fallback
-def _select_topk_numeric(df: pd.DataFrame, y: pd.Series, candidates: list[str], k: int) -> list[str]:
+
+
+# TransformedTargetRegressor helpers must be picklable (no lambdas)
+def _ttr_log1p_clip(y):
     try:
-        X = df[candidates].apply(pd.to_numeric, errors="coerce")
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median(numeric_only=True))
-        y_log = np.log1p(pd.to_numeric(y, errors="coerce").fillna(y.median()))
-        if _mi_reg is not None:
-            mi = _mi_reg(X.values, y_log.values)
-            s = pd.Series(mi, index=candidates)
-            return list(s.sort_values(ascending=False).head(k).index)
+        arr = np.asarray(y, dtype=float)
     except Exception:
-        pass
-    # Fallback to absolute correlation with log target
+        arr = y
+    return np.log1p(np.clip(arr, a_min=0.0, a_max=None))
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Return Pearson correlation(a,b) or nan when degenerate; avoids numpy divide warnings.
+
+    - Drops non-finite pairs
+    - Requires at least 2 points and non-zero std in both vectors
+    - Wraps np.corrcoef in np.errstate
+    """
     try:
+        x = np.asarray(a, dtype=float).reshape(-1)
+        y = np.asarray(b, dtype=float).reshape(-1)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() < 2:
+            return float("nan")
+        x = x[m]
+        y = y[m]
+        if np.std(x) == 0.0 or np.std(y) == 0.0:
+            return float("nan")
         with np.errstate(divide="ignore", invalid="ignore"):
-            corrs = df[candidates].corrwith(np.log1p(y)).abs().fillna(0)
-        return list(corrs.sort_values(ascending=False).head(k).index)
+            c = np.corrcoef(x, y)
+        v = float(c[0, 1]) if c.shape == (2, 2) else float("nan")
+        return v if np.isfinite(v) else float("nan")
     except Exception:
-        return list(candidates[:k])
+        return float("nan")
+
+
+def _select_topk_numeric(
+    df: pd.DataFrame, y: pd.Series, candidates: list[str], k: int
+) -> list[str]:
+    """Score candidates by |corr(log1p(y), x)| computed safely per-column (no numpy divide warnings)."""
+    yy = np.log1p(pd.to_numeric(y, errors="coerce"))
+    scores: list[tuple[str, float]] = []
+    for c in candidates:
+        try:
+            xx = pd.to_numeric(df[c], errors="coerce")
+            s = float(_safe_corr(xx, yy))
+            scores.append((c, abs(s) if np.isfinite(s) else 0.0))
+        except Exception:
+            scores.append((c, 0.0))
+    scores.sort(key=lambda z: z[1], reverse=True)
+    return [c for c, _ in scores[:k]]
 
 
 # Top-level wrapper to allow pickling of log-target models
@@ -1689,9 +2917,11 @@ class LogTargetWrapper:
     def __setstate__(self, state):
         self.base = state["base"]
 
+
 # Backward-compat alias for older pickled artifacts
 class LogExpWrapper(LogTargetWrapper):
     pass
+
 
 # Simple averaging ensemble on original scale
 class AverageEnsemble:
@@ -1720,6 +2950,7 @@ class AverageEnsemble:
     def __setstate__(self, state):
         self.models = state.get("models", [])
 
+
 def make_weights(y: np.ndarray, cap: float, *, scheme: str = "inv_sqrt") -> np.ndarray:
     """Compute base sample weights.
 
@@ -1743,6 +2974,7 @@ def make_weights(y: np.ndarray, cap: float, *, scheme: str = "inv_sqrt") -> np.n
 
 
 # ───────────────────────── Optuna objective ───────────────────────── #
+
 
 def tune_catboost(
     df_full: pd.DataFrame,
@@ -1792,18 +3024,18 @@ def tune_catboost(
         params = {
             "iterations": trial.suggest_int("iterations", 2400, 4500),
             "depth": _depth,
-            "learning_rate": trial.suggest_float("learning_rate", 0.020, 0.040, log=True),
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.020, 0.040, log=True
+            ),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 4.0, 20.0, log=True),
             "random_strength": trial.suggest_float("random_strength", 0.6, 1.8),
             "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", _leaf_low, 224),
             "rsm": trial.suggest_float("rsm", 0.55, 0.80),
             "subsample": trial.suggest_float("subsample", 0.70, 0.95),
-
             "loss_function": "RMSE",
             "eval_metric": _loss_eval,
             "od_type": "Iter",
             "od_wait": 200,
-
             "task_type": task_type,
             "random_seed": RANDOM_STATE,
             "allow_writing_files": False,
@@ -1832,12 +3064,22 @@ def tune_catboost(
             # time-aware features leak-free
             # Compute time features once using TRAIN history only (avoid leakage across folds)
             df_fold = make_time_features(
-                df_full, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
+                df_full,
+                tr_idx,
+                date_col=date_col,
+                target_col=target_col,
+                suburb_col=suburb_col,
             )
             df_fold = _apply_feature_policy(df_fold)
 
-            feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_checker(c)]
-            num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
+            feat_fold = [
+                c
+                for c in df_fold.columns
+                if c not in (target_col, date_col) and not leak_checker(c)
+            ]
+            num_cols_fold = [
+                c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])
+            ]
             cat_cols_fold = [c for c in feat_fold if c not in num_cols_fold]
 
             # light Top-K numeric selection to steady CV
@@ -1845,17 +3087,46 @@ def tune_catboost(
             if len(num_cols_fold) > TOP_K_CV:
                 try:
                     num_cols_fold = _select_topk_numeric(
-                        df_fold.iloc[tr_idx], df_fold.iloc[tr_idx][target_col], num_cols_fold, TOP_K_CV
+                        df_fold.iloc[tr_idx],
+                        df_fold.iloc[tr_idx][target_col],
+                        num_cols_fold,
+                        TOP_K_CV,
                     )
                 except Exception as e:
-                    logging.warning("CV Top-K selection (MI) skipped (fold %d): %s", fold_no, e)
+                    logging.warning(
+                        "CV Top-K selection (MI) skipped (fold %d): %s", fold_no, e
+                    )
+
+            # Pin key stabilized log features and zero-indicators so Ridge has robust numerics in folds
+            try:
+                pins = (
+                    "log_Floor Size (sqm)",
+                    "log_Land Size (sqm)",
+                    "log_Capital Value",
+                    "log_Land Value",
+                    "log_Improvement Value",
+                )
+                zinds = ("Floor Size (sqm)_is_zero", "Land Size (sqm)_is_zero")
+                for p in list(pins) + list(zinds):
+                    if (
+                        (p in df_fold.columns)
+                        and (p not in num_cols_fold)
+                        and pd.api.types.is_numeric_dtype(df_fold[p])
+                    ):
+                        num_cols_fold.append(p)
+            except Exception:
+                pass
 
             # Prefer log variants for key numerics if available
             try:
-                _prefer_log_for = [s.strip() for s in os.getenv(
-                    "PREFER_LOG_FOR",
-                    "Capital Value,Land Value,Days on Market",
-                ).split(",") if s.strip()]
+                _prefer_log_for = [
+                    s.strip()
+                    for s in os.getenv(
+                        "PREFER_LOG_FOR",
+                        "Capital Value,Land Value,Days on Market",
+                    ).split(",")
+                    if s.strip()
+                ]
                 for _base in _prefer_log_for:
                     _raw = _base
                     _logn = f"log_{_base}"
@@ -1867,109 +3138,162 @@ def tune_catboost(
                             num_cols_fold.pop(_idx)
             except Exception:
                 pass
-            num_cols_fold = _filtered_numeric_columns(num_cols_fold)
-            # Reduce reliance on raw region IDs when robust suburb features are active
-            if (DROP_REGION_IDS_IN_CV or (USE_SUBURB_FEATURES and (USE_SUBURB_MEDIANS or USE_SUBURB_LOO))):
-                cat_cols_fold = [c for c in cat_cols_fold if c not in {"Suburb", "Postcode"}]
+        # Finalize numeric list: apply env exclusions
+        num_cols_fold = _filtered_numeric_columns(num_cols_fold)
+        # Reduce reliance on raw region IDs when robust suburb features are active
+        if DROP_REGION_IDS_IN_CV or (
+            USE_SUBURB_FEATURES and (USE_SUBURB_MEDIANS or USE_SUBURB_LOO)
+        ):
+            cat_cols_fold = [
+                c for c in cat_cols_fold if c not in {"Suburb", "Postcode"}
+            ]
 
-            # Fit preprocessor on fold TRAIN only
-            preproc, cat_idx = build_preprocessor(
-                df_fold.iloc[tr_idx], num_cols_fold, cat_cols_fold, scale_numeric, date_col=date_col
+        # Fit preprocessor on fold TRAIN only
+        preproc, cat_idx = build_preprocessor(
+            df_fold.iloc[tr_idx],
+            num_cols_fold,
+            cat_cols_fold,
+            scale_numeric,
+            date_col=date_col,
+        )
+
+        X_tr = preproc.fit_transform(
+            df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]
+        )
+        X_va = preproc.transform(df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold])
+        X_tr = np.array(X_tr, copy=False)
+        X_va = np.array(X_va, copy=False)
+        cat_idx = _expand_cat_indices_for_strings(X_tr, cat_idx)
+        cat_idx = _clip_cat_indices(cat_idx, X_tr.shape[1])
+
+        y_tr = df_fold.iloc[tr_idx][target_col].to_numpy()
+        y_va = df_fold.iloc[val_idx][target_col].to_numpy()
+
+        # Use provided global cap if available; otherwise use fold TRAIN cap
+        cap_tr = float(np.percentile(y_tr, 99.5))
+        _cap = (
+            cap_value
+            if (cap_value is not None and np.isfinite(cap_value) and cap_value > 0)
+            else cap_tr
+        )
+        w_tr = make_weights(y_tr, _cap)
+        # Keep validation weighting geometry consistent with training/global cap
+        w_va = make_weights(y_va, _cap)
+
+        # fold-level outlier weighting (fit only on TRAIN indices of the fold)
+        if use_outlier_scorer:
+            scorer = OutlierScorer(
+                target_col=target_col, suburb_col=suburb_col, date_col=date_col
+            ).fit(df_fold.iloc[tr_idx])
+            flags_tr = scorer.transform(df_fold.iloc[tr_idx])["_outlier"].to_numpy()
+            flags_va = scorer.transform(df_fold.iloc[val_idx])["_outlier"].to_numpy()
+            w_tr = w_tr * np.where(flags_tr, outlier_weight_mult, 1.0)
+            w_va = w_va * np.where(flags_va, outlier_weight_mult, 1.0)
+
+        # Always train on log-target for stability (GPU & CPU)
+        y_tr_fit = np.log1p(y_tr)
+        y_va_fit = np.log1p(y_va)
+
+        # Optional recency weighting (bias toward most recent TRAIN time)
+        if halflife_days and halflife_days > 0:
+            ref_dt = pd.to_datetime(df_fold.iloc[tr_idx][date_col]).max()
+            w_tr = w_tr * _recency_weights(
+                df_fold.iloc[tr_idx][date_col], ref_dt, halflife_days
+            )
+            w_va = w_va * _recency_weights(
+                df_fold.iloc[val_idx][date_col], ref_dt, halflife_days
             )
 
-            X_tr = preproc.fit_transform(df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold])
-            X_va = preproc.transform(df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold])
-            X_tr = np.array(X_tr, copy=False)
-            X_va = np.array(X_va, copy=False)
-            cat_idx = _expand_cat_indices_for_strings(X_tr, cat_idx)
-            cat_idx = _clip_cat_indices(cat_idx, X_tr.shape[1])
-
-            y_tr = df_fold.iloc[tr_idx][target_col].to_numpy()
-            y_va = df_fold.iloc[val_idx][target_col].to_numpy()
-
-            # Use provided global cap if available; otherwise use fold TRAIN cap
-            cap_tr = float(np.percentile(y_tr, 99.5))
-            _cap = cap_value if (cap_value is not None and np.isfinite(cap_value) and cap_value > 0) else cap_tr
-            w_tr = make_weights(y_tr, _cap)
-            # Keep validation weighting geometry consistent with training/global cap
-            w_va = make_weights(y_va, _cap)
-
-            # fold-level outlier weighting (fit only on TRAIN indices of the fold)
-            if use_outlier_scorer:
-                scorer = OutlierScorer(
-                    target_col=target_col, suburb_col=suburb_col, date_col=date_col
-                ).fit(df_fold.iloc[tr_idx])
-                flags_tr = scorer.transform(df_fold.iloc[tr_idx])["_outlier"].to_numpy()
-                flags_va = scorer.transform(df_fold.iloc[val_idx])["_outlier"].to_numpy()
-                w_tr = w_tr * np.where(flags_tr, outlier_weight_mult, 1.0)
-                w_va = w_va * np.where(flags_va, outlier_weight_mult, 1.0)
-
-            # Always train on log-target for stability (GPU & CPU)
-            y_tr_fit = np.log1p(y_tr)
-            y_va_fit = np.log1p(y_va)
-
-            # Optional recency weighting (bias toward most recent TRAIN time)
-            if halflife_days and halflife_days > 0:
-                ref_dt = pd.to_datetime(df_fold.iloc[tr_idx][date_col]).max()
-                w_tr = w_tr * _recency_weights(df_fold.iloc[tr_idx][date_col], ref_dt, halflife_days)
-                w_va = w_va * _recency_weights(df_fold.iloc[val_idx][date_col], ref_dt, halflife_days)
-
-            # Optional monotonic constraints (env-driven)
-            params_fold = params
-            mono_list = _mono_from_env(num_cols_fold)
-            if mono_list is None and ENFORCE_MONOTONE:
+        # Optional monotonic constraints (env-driven)
+        params_fold = params
+        mono_list = _mono_from_env(num_cols_fold)
+        if mono_list is None and ENFORCE_MONOTONE:
+            try:
+                _mono_pos = {"Bath", "Car"}
+                mono_list = [1 if (c in _mono_pos) else 0 for c in num_cols_fold]
+            except Exception:
+                mono_list = None
+        # Apply monotone constraints only on CPU; GPU throws when this changes across runs
+        if mono_list is not None and (
+            params_fold.get("task_type", "CPU").upper() != "GPU"
+        ):
+            params_fold = {**params_fold, "monotone_constraints": mono_list}
+            if MONO_DEBUG:
                 try:
-                    _mono_pos = {"Bath", "Car"}
-                    mono_list = [1 if (c in _mono_pos) else 0 for c in num_cols_fold]
-                except Exception:
-                    mono_list = None
-            if mono_list is not None:
-                params_fold = {**params_fold, "monotone_constraints": mono_list}
+                    from mono_debug import append_mono_map  # type: ignore
 
-            if CB_THREAD_COUNT > 0:
-                params_fold = {**params_fold, "thread_count": CB_THREAD_COUNT}
-                model = CatBoostRegressor(**params_fold)
-                try:
-                    eval_pool = Pool(X_va, y_va_fit, cat_features=cat_idx, weight=w_va)
-                except Exception:
-                    eval_pool = None
-                try:
-                    model.fit(
-                        X_tr,
-                        y_tr_fit,
-                        sample_weight=w_tr,
-                        cat_features=cat_idx,
-                        eval_set=eval_pool,
-                        early_stopping_rounds=200,
-                        use_best_model=True,
-                        verbose=False,
+                    append_mono_map(
+                        artifacts_dir=str(ARTIFACT_DIR),
+                        tag="cv_objective",
+                        fold=int(fold_no),
+                        features=[str(c) for c in num_cols_fold],
+                        constraints=[int(x) for x in mono_list],
                     )
                 except Exception:
-                    # Fallback without eval_set for tests/stubs
-                    model.fit(
-                        X_tr,
-                        y_tr_fit,
-                        sample_weight=w_tr,
-                        cat_features=cat_idx,
-                        verbose=False,
-                    )
+                    pass
+        elif MONO_DEBUG:
+            # Log numeric feature list even when constraints are disabled
+            try:
+                from mono_debug import append_mono_map  # type: ignore
 
-            _pred = model.predict(X_va)
-            y_pred = _safe_expm1(_pred)
-            metric = opt_metric.lower()
-            if metric == "wmae":
-                score = float(np.sum(w_va * np.abs(y_va - y_pred)) / np.sum(w_va))
-            elif metric == "mae":
-                score = float(np.mean(np.abs(y_va - y_pred)))
-            elif metric == "rmse":
-                score = float(np.sqrt(np.mean((y_va - y_pred) ** 2)))
-            elif metric == "mape":
-                mask = y_va > 0
-                score = float(np.mean(np.abs((y_va[mask] - y_pred[mask]) / y_va[mask]))) if mask.any() else float("inf")
-            else:
-                # default to weighted MAE for stability
-                score = float(np.sum(w_va * np.abs(y_va - y_pred)) / np.sum(w_va))
-            fold_scores.append(score)
+                append_mono_map(
+                    artifacts_dir=str(ARTIFACT_DIR),
+                    tag="cv_objective",
+                    fold=int(fold_no),
+                    features=[str(c) for c in num_cols_fold],
+                    constraints=[0 for _ in num_cols_fold],
+                )
+            except Exception:
+                pass
+
+        if CB_THREAD_COUNT > 0:
+            params_fold = {**params_fold, "thread_count": CB_THREAD_COUNT}
+        model = CatBoostRegressor(**params_fold)
+        try:
+            eval_pool = Pool(X_va, y_va_fit, cat_features=cat_idx, weight=w_va)
+        except Exception:
+            eval_pool = None
+        try:
+            model.fit(
+                X_tr,
+                y_tr_fit,
+                sample_weight=w_tr,
+                cat_features=cat_idx,
+                eval_set=eval_pool,
+                early_stopping_rounds=200,
+                use_best_model=True,
+                verbose=False,
+            )
+        except Exception:
+            # Fallback without eval_set for tests/stubs
+            model.fit(
+                X_tr,
+                y_tr_fit,
+                sample_weight=w_tr,
+                cat_features=cat_idx,
+                verbose=False,
+            )
+
+        _pred = model.predict(X_va)
+        y_pred = _safe_expm1(_pred)
+        metric = opt_metric.lower()
+        if metric == "wmae":
+            score = float(np.sum(w_va * np.abs(y_va - y_pred)) / np.sum(w_va))
+        elif metric == "mae":
+            score = float(np.mean(np.abs(y_va - y_pred)))
+        elif metric == "rmse":
+            score = float(np.sqrt(np.mean((y_va - y_pred) ** 2)))
+        elif metric == "mape":
+            mask = y_va > 0
+            score = (
+                float(np.mean(np.abs((y_va[mask] - y_pred[mask]) / y_va[mask])))
+                if mask.any()
+                else float("inf")
+            )
+        else:
+            # default to weighted MAE for stability
+            score = float(np.sum(w_va * np.abs(y_va - y_pred)) / np.sum(w_va))
+        fold_scores.append(score)
 
         return float(np.mean(fold_scores))
 
@@ -1996,7 +3320,12 @@ def tune_catboost(
             timeout=None if timeout_sec <= 0 else timeout_sec,
         )
     try:
-        logging.info("Optuna best CV-%s %.3f after %d trials", opt_metric.upper(), study.best_value, len(study.trials))
+        logging.info(
+            "Optuna best CV-%s %.3f after %d trials",
+            opt_metric.upper(),
+            study.best_value,
+            len(study.trials),
+        )
     except Exception:
         logging.info("Optuna CV optimization completed (stubbed study).")
     best = study.best_params
@@ -2010,6 +3339,7 @@ def tune_catboost(
 
 
 # ───────────────────────────── Train function ───────────────────────────── #
+
 
 def train_model(
     df_raw: pd.DataFrame,
@@ -2033,6 +3363,9 @@ def train_model(
     removed_tracker: Any | None = None,
 ) -> dict:
     geo_env_cfg = _geo_env_config()
+    # Initialize removed rows collector if not provided
+    if removed_tracker is None:
+        removed_tracker = _RemovedRowsCollector()
     logging.info("Step 1/6 – feature engineering + split")
     # Allow environment override for optimization metric (e.g., OPT_LOSS=rmse)
     try:
@@ -2053,15 +3386,38 @@ def train_model(
     except Exception:
         # Fallback: attempt to coerce provided names directly
         pass
+    try:
+        logging.info(
+            "Resolved columns — date: %s | target: %s | suburb: %s",
+            date_col,
+            target_col,
+            suburb_col,
+        )
+    except Exception:
+        pass
 
     df_raw = df_raw.copy(deep=False)
+    # Add stable row id for removal tracking early
+    if "__row_id" not in df_raw.columns:
+        try:
+            df_raw["__row_id"] = np.arange(len(df_raw), dtype=int)
+        except Exception:
+            pass
     if date_col in df_raw.columns:
         df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
         nat_mask = df_raw[date_col].isna()
         if nat_mask.any():
-            removed_ids = df_raw.loc[nat_mask, "__row_id"].astype(int, copy=False).tolist() if "__row_id" in df_raw.columns else []
-            _record_removed_rows(removed_tracker, "train_drop_invalid_dates", df_raw, removed_ids)
-            logging.warning("Dropping %d rows with invalid %s (NaT)", nat_mask.sum(), date_col)
+            removed_ids = (
+                df_raw.loc[nat_mask, "__row_id"].astype(int, copy=False).tolist()
+                if "__row_id" in df_raw.columns
+                else []
+            )
+            _record_removed_rows(
+                removed_tracker, "train_drop_invalid_dates", df_raw, removed_ids
+            )
+            logging.warning(
+                "Dropping %d rows with invalid %s (NaT)", nat_mask.sum(), date_col
+            )
             df_raw = df_raw.loc[~nat_mask].copy()
         # Sort chronologically for stability
         try:
@@ -2075,21 +3431,40 @@ def train_model(
             cutoff = pd.to_datetime(os.getenv("DATE_MIN"), errors="coerce")
             if pd.notna(cutoff):
                 mask = df_raw[date_col] >= cutoff
-                removed_ids = df_raw.loc[~mask, "__row_id"].astype(int, copy=False).tolist() if "__row_id" in df_raw.columns else []
-                _record_removed_rows(removed_tracker, "train_date_min_filter", df_raw, removed_ids)
+                removed_ids = (
+                    df_raw.loc[~mask, "__row_id"].astype(int, copy=False).tolist()
+                    if "__row_id" in df_raw.columns
+                    else []
+                )
+                _record_removed_rows(
+                    removed_tracker, "train_date_min_filter", df_raw, removed_ids
+                )
                 removed = int((~mask).sum())
                 df_raw = df_raw.loc[mask].copy()
-                logging.info("DATE_MIN filter %s removed %d rows", cutoff.date(), removed)
+                logging.info(
+                    "DATE_MIN filter %s removed %d rows", cutoff.date(), removed
+                )
         elif os.getenv("RECENT_YEARS"):
             yrs = int(os.getenv("RECENT_YEARS", "0"))
             if yrs > 0:
                 cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=yrs)
                 mask = df_raw[date_col] >= cutoff
-                removed_ids = df_raw.loc[~mask, "__row_id"].astype(int, copy=False).tolist() if "__row_id" in df_raw.columns else []
-                _record_removed_rows(removed_tracker, "train_recent_years_filter", df_raw, removed_ids)
+                removed_ids = (
+                    df_raw.loc[~mask, "__row_id"].astype(int, copy=False).tolist()
+                    if "__row_id" in df_raw.columns
+                    else []
+                )
+                _record_removed_rows(
+                    removed_tracker, "train_recent_years_filter", df_raw, removed_ids
+                )
                 removed = int((~mask).sum())
                 df_raw = df_raw.loc[mask].copy()
-                logging.info("RECENT_YEARS=%d filter (cutoff %s) removed %d rows", yrs, cutoff.date(), removed)
+                logging.info(
+                    "RECENT_YEARS=%d filter (cutoff %s) removed %d rows",
+                    yrs,
+                    cutoff.date(),
+                    removed,
+                )
     except Exception:
         pass
 
@@ -2098,21 +3473,40 @@ def train_model(
         df_raw[target_col] = pd.to_numeric(df_raw[target_col], errors="coerce")
     mask_target_na = df_raw[target_col].isna()
     if mask_target_na.any():
-        removed_ids = df_raw.loc[mask_target_na, "__row_id"].astype(int, copy=False).tolist() if "__row_id" in df_raw.columns else []
-        _record_removed_rows(removed_tracker, "train_drop_non_numeric_target", df_raw, removed_ids)
-        logging.warning("Dropping %d rows with non-numeric %s", mask_target_na.sum(), target_col)
+        removed_ids = (
+            df_raw.loc[mask_target_na, "__row_id"].astype(int, copy=False).tolist()
+            if "__row_id" in df_raw.columns
+            else []
+        )
+        _record_removed_rows(
+            removed_tracker, "train_drop_non_numeric_target", df_raw, removed_ids
+        )
+        logging.warning(
+            "Dropping %d rows with non-numeric %s", mask_target_na.sum(), target_col
+        )
         df_raw = df_raw.loc[~mask_target_na].copy()
 
     # Safety guard: enforce target domain even if cleaning was bypassed
     try:
         _tmin = float(os.getenv("TARGET_MIN", "0"))
-        _tmax = float(os.getenv("TARGET_MAX", "2000"))
+        _tmax = float(os.getenv("TARGET_MAX", "2500"))
         mask_range = (df_raw[target_col] >= _tmin) & (df_raw[target_col] <= _tmax)
         if mask_range.any():
-            removed_ids = df_raw.loc[~mask_range, "__row_id"].astype(int, copy=False).tolist() if "__row_id" in df_raw.columns else []
+            removed_ids = (
+                df_raw.loc[~mask_range, "__row_id"].astype(int, copy=False).tolist()
+                if "__row_id" in df_raw.columns
+                else []
+            )
             if removed_ids:
-                logging.warning("Safety target filter removed %d rows outside [%.0f, %.0f]", len(removed_ids), _tmin, _tmax)
-                _record_removed_rows(removed_tracker, "train_target_domain_filter", df_raw, removed_ids)
+                logging.warning(
+                    "Safety target filter removed %d rows outside [%.0f, %.0f]",
+                    len(removed_ids),
+                    _tmin,
+                    _tmax,
+                )
+                _record_removed_rows(
+                    removed_tracker, "train_target_domain_filter", df_raw, removed_ids
+                )
             df_raw = df_raw.loc[mask_range].copy()
         else:
             logging.warning("Safety target filter skipped: would remove all rows")
@@ -2126,15 +3520,23 @@ def train_model(
     # Clean strings + ordinals + date parts
     df = _apply_ordinals(_clean_strings(df_raw))
     df = add_date_parts(df, date_col)
-    df = _try_add_geo_features(df)  # NEW: optional geo enrichment (no-op if not configured)
-    df = df.drop(columns=[c for c in df.columns if c.lower() in _HELPER_LEAKS], errors="ignore")
+    df = _try_add_geo_features(
+        df
+    )  # NEW: optional geo enrichment (no-op if not configured)
+    df = df.drop(
+        columns=[c for c in df.columns if c.lower() in _HELPER_LEAKS], errors="ignore"
+    )
 
-     # Ensure log versions exist for key heavy‑tailed numerics used downstream
+    # Ensure log versions exist for key heavy-tailed numerics used downstream
     try:
-        _prefer_log_for = [s.strip() for s in os.getenv(
-            "PREFER_LOG_FOR",
-            "Capital Value,Land Value,Days on Market",
-        ).split(",") if s.strip()]
+        _prefer_log_for = [
+            s.strip()
+            for s in os.getenv(
+                "PREFER_LOG_FOR",
+                "Capital Value,Land Value,Improvement Value,Land Size (sqm),Floor Size (sqm),Days on Market",
+            ).split(",")
+            if s.strip()
+        ]
         for _base in _prefer_log_for:
             if _base in df.columns:
                 _col = pd.to_numeric(df[_base], errors="coerce").clip(lower=0)
@@ -2144,7 +3546,11 @@ def train_model(
 
     # Safe log augment for heavy-tailed numerics (avoid double-logging)
     base_feats = [c for c in df.columns if c not in (target_col, date_col)]
-    num_raw = [c for c in base_feats if pd.api.types.is_numeric_dtype(df[c]) and not str(c).startswith("log_")]
+    num_raw = [
+        c
+        for c in base_feats
+        if pd.api.types.is_numeric_dtype(df[c]) and not str(c).startswith("log_")
+    ]
     _skews = {}
     for col in num_raw:
         if pd.api.types.is_bool_dtype(df[col]):
@@ -2174,12 +3580,20 @@ def train_model(
         if ("Floor Size (sqm)" in df.columns) and ("Land Size (sqm)" in df.columns):
             flr = pd.to_numeric(df["Floor Size (sqm)"], errors="coerce").clip(lower=0)
             land = pd.to_numeric(df["Land Size (sqm)"], errors="coerce").clip(lower=0)
-            df["floor_land_ratio"] = (flr / land.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+            df["floor_land_ratio"] = (
+                (flr / land.replace(0, np.nan))
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
         # Bed/bath ratio (stability guarded)
         if ("Bed" in df.columns) and ("Bath" in df.columns):
             bed = pd.to_numeric(df["Bed"], errors="coerce").clip(lower=0)
             bath = pd.to_numeric(df["Bath"], errors="coerce").clip(lower=0)
-            df["bed_bath_ratio"] = (bed / bath.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+            df["bed_bath_ratio"] = (
+                (bed / bath.replace(0, np.nan))
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
         # Car capacity flags to prevent negative association from rarity effects
         if "Car" in df.columns:
             carn = pd.to_numeric(df["Car"], errors="coerce").fillna(0)
@@ -2194,14 +3608,26 @@ def train_model(
 
     # Optional address deduplication (safeguard against duplicates)
     if dedup_by_address:
-        addr_cols = [c for c in df.columns if c.lower() in {"address", "street address", "street", "full_address"}]
+        addr_cols = [
+            c
+            for c in df.columns
+            if c.lower() in {"address", "street address", "street", "full_address"}
+        ]
         if addr_cols:
             key_cols = [addr_cols[0], date_col]
             before = len(df)
             df = df.drop_duplicates(subset=key_cols, keep="last").reset_index(drop=True)
-            logging.info("Dedup by address+date removed %d duplicate rows", before - len(df))
+            logging.info(
+                "Dedup by address+date removed %d duplicate rows", before - len(df)
+            )
         else:
             logging.info("Dedup requested but no address-like column found; skipping")
+
+    # Precompute stable group ids (suburb + normalized address; lat/lon fallback)
+    try:
+        _group_ids = _stable_group_id(df, suburb_col)
+    except Exception:
+        _group_ids = None
 
     # Block CV geometry & final split
     if block_cv:
@@ -2211,18 +3637,18 @@ def train_model(
             gap_m = int(os.getenv("GAP_MONTHS", "0"))
             gap_d = GAP_DAYS if GAP_DAYS > 0 else (0 if gap_m > 0 else _auto_gap_days())
             folds_glob = make_walk_folds(labels, gap_months=(0 if gap_d > 0 else gap_m))
-            # Optional group purge using address-like column if present
-            grp_arr = None
-            for cand in ("Address", "Street Address", "Full_Address", "property_id"):
-                if cand in df.columns:
-                    grp_arr = df[cand].astype("string").to_numpy()
-                    break
-            folds_glob = purge_groups(folds_glob, grp_arr)
+            # Group purge using stable group id if available
+            folds_glob = purge_groups(
+                folds_glob, _group_ids.to_numpy() if _group_ids is not None else None
+            )
             # Absolute day-level embargo (explicit or auto)
             folds_glob = apply_gap_days(folds_glob, df[date_col], gap_d)
             logging.info(
                 "Block CV: walk-forward → %d folds (gap_months=%d, gap_days=%d, group_purged=%s)",
-                len(folds_glob), (0 if gap_d > 0 else gap_m), gap_d, "yes" if grp_arr is not None else "no"
+                len(folds_glob),
+                (0 if gap_d > 0 else gap_m),
+                gap_d,
+                "yes" if _group_ids is not None else "no",
             )
         else:
             folds_glob = make_mc_folds(labels)
@@ -2238,35 +3664,92 @@ def train_model(
             early_months=EARLY_HOLDOUT_MONTHS,
             gap_months=GAP_MONTHS_OVERRIDE,
         )
-        if (te_i.size == 0) or (ea_i.size > 0 and ea_i.size < MIN_EARLY_ROWS) or (te_i.size < MIN_TEST_ROWS):
+        if (
+            (te_i.size == 0)
+            or (ea_i.size > 0 and ea_i.size < MIN_EARLY_ROWS)
+            or (te_i.size < MIN_TEST_ROWS)
+        ):
             # Not enough months → gracefully fall back to simple chronological split
             n_rows = len(df)
             train_end = max(1, int(n_rows * train_frac))
-            early_end = min(max(train_end + 1, int(n_rows * (train_frac + valid_frac))), n_rows - 1)
+            early_end = min(
+                max(train_end + 1, int(n_rows * (train_frac + valid_frac))), n_rows - 1
+            )
             train_idx = np.arange(0, train_end, dtype=int)
             early_idx = np.arange(train_end, early_end, dtype=int)
             test_idx = np.arange(early_end, n_rows, dtype=int)
             cv_folds = None
         else:
             train_idx, early_idx, test_idx = tr_i, ea_i, te_i
-            # Build walk-forward CV strictly before EARLY/TEST
-            labels_all = make_block_labels(df[date_col])
-            folds_all = make_walk_folds(labels_all, gap_months=GAP_MONTHS_OVERRIDE)
-            folds_all = apply_gap_days(folds_all, df[date_col], GAP_DAYS if GAP_DAYS > 0 else _auto_gap_days())
-            cutoff = int(np.min(early_idx)) if early_idx.size else int(np.min(test_idx))
-            cv_folds = [(tr, va) for (tr, va) in folds_all if va.size and va.min() < cutoff]
+            # Group-block across holdout boundaries
+            try:
+                if _group_ids is not None:
+                    g = _group_ids
+                    g_te = set(g.iloc[test_idx].astype(str))
+                    g_ea = set(g.iloc[early_idx].astype(str))
+                    keep_tr = ~np.isin(
+                        g.iloc[train_idx].astype(str).to_numpy(), list(g_te | g_ea)
+                    )
+                    keep_ea = ~np.isin(
+                        g.iloc[early_idx].astype(str).to_numpy(), list(g_te)
+                    )
+                    train_idx = np.sort(train_idx[np.where(keep_tr)[0]])
+                    early_idx = np.sort(early_idx[np.where(keep_ea)[0]])
+                    test_idx = np.sort(test_idx)
+            except Exception:
+                pass
+            # Build CV folds (default: time-aware for rentals)
+            # For Ames-mode (opt-in), use shuffled KFold for both Optuna and OOF stability.
+            if CV_MODE == "ames_kfold":
+                cv_folds = list(
+                    _cv_iter_ames_kfold(
+                        len(df), n_splits=AMES_KFOLD_SPLITS, seed=AMES_KFOLD_SEED
+                    )
+                )
+                logging.info(
+                    "CV mode: ames_kfold (n_splits=%d, seed=%d)",
+                    AMES_KFOLD_SPLITS,
+                    AMES_KFOLD_SEED,
+                )
+            else:
+                # Build walk-forward CV strictly before EARLY/TEST
+                labels_all = make_block_labels(df[date_col])
+                folds_all = make_walk_folds(labels_all, gap_months=GAP_MONTHS_OVERRIDE)
+                folds_all = apply_gap_days(
+                    folds_all,
+                    df[date_col],
+                    GAP_DAYS if GAP_DAYS > 0 else _auto_gap_days(),
+                )
+                cutoff = (
+                    int(np.min(early_idx)) if early_idx.size else int(np.min(test_idx))
+                )
+                cv_folds = [
+                    (tr, va) for (tr, va) in folds_all if va.size and va.min() < cutoff
+                ]
+                # Purge groups within CV folds
+                try:
+                    cv_folds = purge_groups(
+                        cv_folds,
+                        _group_ids.to_numpy() if _group_ids is not None else None,
+                    )
+                except Exception:
+                    pass
     elif not folds_glob or len(folds_glob) < 3:
         # Fallback simple chronological split
         n_rows = len(df)
         train_end = max(1, int(n_rows * train_frac))
-        early_end = min(max(train_end + 1, int(n_rows * (train_frac + valid_frac))), n_rows - 1)
+        early_end = min(
+            max(train_end + 1, int(n_rows * (train_frac + valid_frac))), n_rows - 1
+        )
         train_idx = np.arange(0, train_end, dtype=int)
         early_idx = np.arange(train_end, early_end, dtype=int)
         test_idx = np.arange(early_end, n_rows, dtype=int)
         cv_folds = None
     else:
         # Use disjoint EARLY/TEST blocks; TRAIN strictly before earliest EARLY
-        early_idx = np.unique(np.concatenate([folds_glob[-3][1], folds_glob[-2][1]])).astype(int)
+        early_idx = np.unique(
+            np.concatenate([folds_glob[-3][1], folds_glob[-2][1]])
+        ).astype(int)
         test_idx = np.unique(folds_glob[-1][1]).astype(int)
         train_idx = np.unique(folds_glob[-3][0]).astype(int)
         cutoff = int(np.min(early_idx)) if early_idx.size else len(df)
@@ -2275,20 +3758,130 @@ def train_model(
         cv_last_k = int(os.getenv("CV_LAST_K_FOLDS", "6"))
         start = max(0, len(folds_glob) - 3 - cv_last_k)
         cv_folds = folds_glob[start : len(folds_glob) - 3]
+        # Group-block across holdout boundaries and purge CV folds
+        try:
+            if _group_ids is not None:
+                g = _group_ids
+                g_te = set(g.iloc[test_idx].astype(str))
+                g_ea = set(g.iloc[early_idx].astype(str))
+                keep_tr = ~np.isin(
+                    g.iloc[train_idx].astype(str).to_numpy(), list(g_te | g_ea)
+                )
+                keep_ea = ~np.isin(g.iloc[early_idx].astype(str).to_numpy(), list(g_te))
+                train_idx = np.sort(train_idx[np.where(keep_tr)[0]])
+                early_idx = np.sort(early_idx[np.where(keep_ea)[0]])
+                test_idx = np.sort(test_idx)
+                cv_folds = purge_groups(cv_folds, _group_ids.to_numpy())
+        except Exception:
+            pass
 
-    # Make leak-safe time features using TRAIN history only
-    df_time = make_time_features(df, train_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col)
+    # Recency v2 (as-of anchors) gated by RECENCY_V2
+    if os.getenv("RECENCY_V2", "1").lower() in {"1", "true", "yes"}:
+        try:
+            df = add_rec2_features(
+                df,
+                train_idx,
+                date_col=date_col,
+                target_col=target_col,
+                suburb_col=suburb_col,
+            )
+        except Exception as _r2e:
+            logging.warning("RECENCY_V2 computation skipped: %s", _r2e)
+    # Legacy time features retained for backward compatibility
+    df_time = make_time_features(
+        df, train_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
+    )
     df_time = _apply_feature_policy(df_time)
     if df_time.empty:
         df_time = df.copy()
+    # Ensure required rec2/SuburbBed columns exist to avoid hard failure when RECENCY_V2 is enabled
+    try:
+        _required = [
+            "rec2_suburbbed_med_30d",
+            "rec2_suburbbed_med_90d",
+            "rec2_suburbbed_med_180d",
+            "rec2_suburbbed_med_365d",
+            "SuburbBed90dMedian",
+        ]
+        for _c in _required:
+            if _c not in df_time.columns:
+                df_time[_c] = np.nan
+    except Exception:
+        pass
     # Leak-safe momentum feature: short vs long suburb median
     try:
-        if USE_SUBURB_MEDIANS and "Suburb90dMedian" in df_time.columns and "Suburb365dMedian" in df_time.columns:
-            den = pd.to_numeric(df_time["Suburb365dMedian"], errors="coerce").replace(0, np.nan)
+        if (
+            USE_SUBURB_MEDIANS
+            and "Suburb90dMedian" in df_time.columns
+            and "Suburb365dMedian" in df_time.columns
+        ):
+            den = pd.to_numeric(df_time["Suburb365dMedian"], errors="coerce").replace(
+                0, np.nan
+            )
             num = pd.to_numeric(df_time["Suburb90dMedian"], errors="coerce")
-            df_time["SuburbMomentum90v365"] = (num / den).replace([np.inf, -np.inf], np.nan)
+            df_time["SuburbMomentum90v365"] = (num / den).replace(
+                [np.inf, -np.inf], np.nan
+            )
     except Exception as _e:
         logging.warning("Suburb momentum feature skipped: %s", _e)
+
+    # Strict guard (modular) for recency/suburbbed medians
+    try:
+        _rec2_on = os.getenv("RECENCY_V2", "1").lower() in {"1", "true", "yes"}
+    except Exception:
+        _rec2_on = True
+    try:
+        _ds_hash = hashlib.sha256(
+            np.sort(df_raw[target_col].values).tobytes()
+        ).hexdigest()[:8]
+    except Exception:
+        _ds_hash = None
+    assert_recency_features(
+        df_time,
+        use_suburb_features=bool(USE_SUBURB_FEATURES),
+        recency_v2_on=bool(_rec2_on),
+        plots_dir=PLOTS_DIR,
+        ds_hash=_ds_hash,
+    )
+
+    # Optional: features-only dry run (fast) – guarded to avoid accidental early exits
+    try:
+        _features_only_flag = os.getenv(
+            "FEATURES_ONLY", os.getenv("DRY_RUN_FEATURES", "0")
+        ).lower() in {"1", "true", "yes"}
+    except Exception:
+        _features_only_flag = False
+    # Require explicit allow to prevent surprise early termination, and skip when trials requested
+    _allow_features_only = os.getenv("ALLOW_FEATURES_ONLY", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        _trials_req = int(os.getenv("OPTUNA_TRIALS", "0") or 0)
+    except Exception:
+        _trials_req = 0
+    if _features_only_flag and _allow_features_only and _trials_req <= 0:
+        features_only_export(
+            df_time, df_raw, target_col=target_col, plots_dir=PLOTS_DIR
+        )
+        return {
+            "pipeline": None,
+            "metadata": None,
+            "importance": None,
+            "shap": None,
+            "model": None,
+        }
+    elif _features_only_flag and not _allow_features_only:
+        logging.info(
+            "Ignoring FEATURES_ONLY due to ALLOW_FEATURES_ONLY=0 (default). Proceeding with training."
+        )
+    elif _features_only_flag and _trials_req > 0:
+        logging.info(
+            "Ignoring FEATURES_ONLY because OPTUNA_TRIALS=%d was requested.",
+            _trials_req,
+        )
+
     train_idx = train_idx[(train_idx >= 0) & (train_idx < len(df_time))]
     early_idx = early_idx[(early_idx >= 0) & (early_idx < len(df_time))]
     test_idx = test_idx[(test_idx >= 0) & (test_idx < len(df_time))]
@@ -2308,33 +3901,77 @@ def train_model(
         train_df = df_time.iloc[train_idx].copy()
 
     # Dataset hash for artifact names
-    ds_hash = hashlib.sha256(np.sort(df_raw[target_col].values).tobytes()).hexdigest()[:8]
+    ds_hash = hashlib.sha256(np.sort(df_raw[target_col].values).tobytes()).hexdigest()[
+        :8
+    ]
+    folds_csv_path = None
+    cv_fold_rows: list[
+        dict
+    ] = []  # Initialize early so save logic can reference it later
 
     # Quick diagnostics
-    for nm, ser in (("TRAIN", train_df[target_col]), ("EARLY", early_df[target_col]), ("TEST", test_df[target_col])):
+    for nm, ser in (
+        ("TRAIN", train_df[target_col]),
+        ("EARLY", early_df[target_col]),
+        ("TEST", test_df[target_col]),
+    ):
         logging.info(
             "%s rent | n=%d | min=%.2f | p25=%.2f | p50=%.2f | p75 %.2f | p95 %.2f | max=%.2f",
-            nm, len(ser), ser.min(), ser.quantile(0.25), ser.median(), ser.quantile(0.75), ser.quantile(0.95), ser.max()
+            nm,
+            len(ser),
+            ser.min(),
+            ser.quantile(0.25),
+            ser.median(),
+            ser.quantile(0.75),
+            ser.quantile(0.95),
+            ser.max(),
         )
 
     # Build feature sets (now that LOO exists)
     leak_check = make_leak_checker(target_col)
-    feature_cols = [c for c in train_df.columns if c not in (target_col, date_col) and not leak_check(c)]
+    feature_cols = [
+        c
+        for c in train_df.columns
+        if c not in (target_col, date_col) and not leak_check(c)
+    ]
     # Remove meta/string-heavy columns that should never enter the model
     for bad in ("street_address", "__geo_query__"):
         if bad in feature_cols:
             feature_cols.remove(bad)
     # Remove high-cardinality ID-like columns that add noise (address-level)
-    feature_cols = [c for c in feature_cols if c not in {"Street Address", "Address", "Full_Address"}]
+    feature_cols = [
+        c
+        for c in feature_cols
+        if c not in {"Street Address", "Address", "Full_Address"}
+    ]
     # Ensure key suburb context features are included (gated by flags)
     if USE_SUBURB_FEATURES:
         always: list[str] = []
         if USE_SUBURB_MEDIANS:
             always.extend(["SuburbBed90dMedian", "Suburb90dMedian"])
             if USE_SUBURB_365D_MEDIAN:
-                always.extend(["Suburb365dMedian", "SuburbBed365dMedian"])  # include bed-conditional 365D
+                always.extend(
+                    ["Suburb365dMedian", "SuburbBed365dMedian"]
+                )  # include bed-conditional 365D
         if USE_SUBURB_LOO:
             always.extend(["Suburb_LOO", "SuburbMonth_LOO"])
+        # Add RECENCY_V2 (rec2_*) features to always-keep list so they survive TOP_K selection
+        if os.getenv("RECENCY_V2", "1").lower() in {"1", "true", "yes"}:
+            rec2_features = [
+                "rec2_suburb_med_30d",
+                "rec2_suburb_med_90d",
+                "rec2_suburb_med_180d",
+                "rec2_suburb_med_365d",
+                "rec2_suburbbed_med_30d",
+                "rec2_suburbbed_med_90d",
+                "rec2_suburbbed_med_180d",
+                "rec2_suburbbed_med_365d",
+                "rec2_mom_suburb_30_365",
+                "rec2_mom_suburb_90_365",
+                "rec2_mom_suburbbed_30_365",
+                "rec2_mom_suburbbed_90_365",
+            ]
+            always.extend(rec2_features)
         for must in always:
             if must in train_df.columns and must not in feature_cols:
                 feature_cols.append(must)
@@ -2347,16 +3984,38 @@ def train_model(
         num_all.append("floor_to_bed_med")
     TOP_K_NUM = int(os.getenv("FINAL_TOPK_NUM", "28"))
     # Remove engineered logs we never want the model to learn from directly
-    _forbidden_logs = {"log_Car", "log_Bath", "log_Garage", "log_Garage Parks", "log_garage_parks"}
+    _forbidden_logs = {
+        "log_Car",
+        "log_Bath",
+        "log_Garage",
+        "log_Garage Parks",
+        "log_garage_parks",
+    }
     if len(num_all) > TOP_K_NUM:
         nonconst = [c for c in num_all if train_df[c].nunique(dropna=True) > 1]
-        num_cols = _select_topk_numeric(train_df, train_df[target_col], nonconst, TOP_K_NUM)
+        num_cols = _select_topk_numeric(
+            train_df, train_df[target_col], nonconst, TOP_K_NUM
+        )
         # Filter out low-signal or misleading engineered logs from core numeric list
         num_cols = [c for c in num_cols if c not in _forbidden_logs]
         # ensure LOO present if numeric
         for extra in ("Suburb_LOO", "SuburbMonth_LOO"):
             if extra in num_all and extra not in num_cols:
                 num_cols.append(extra)
+        # ensure Suburb medians survive TOP_K trimming
+        for suburb_med in (
+            "Suburb90dMedian",
+            "SuburbBed90dMedian",
+            "Suburb365dMedian",
+            "SuburbBed365dMedian",
+        ):
+            if suburb_med in num_all and suburb_med not in num_cols:
+                num_cols.append(suburb_med)
+        # ensure rec2 features survive TOP_K trimming (RECENCY_V2)
+        if os.getenv("RECENCY_V2", "1").lower() in {"1", "true", "yes"}:
+            for rec2_feat in num_all:
+                if str(rec2_feat).startswith("rec2_") and rec2_feat not in num_cols:
+                    num_cols.append(rec2_feat)
         # ensure bed-normalized size feature is kept
         if "floor_to_bed_med" in num_all and "floor_to_bed_med" not in num_cols:
             num_cols.append("floor_to_bed_med")
@@ -2366,6 +4025,21 @@ def train_model(
         # ensure raw Garage Parks retained if available (numeric garage capacity)
         if "Garage Parks" in num_all and "Garage Parks" not in num_cols:
             num_cols.append("Garage Parks")
+
+        # ensure key log numerics survive Top-K trimming
+        for pinned in (
+            "log_Floor Size (sqm)",
+            "log_Land Size (sqm)",
+            "log_Capital Value",
+            "log_Land Value",
+            "log_Improvement Value",
+        ):
+            if pinned in num_all and pinned not in num_cols:
+                num_cols.append(pinned)
+        # also keep zero indicators if present
+        for z in ("Floor Size (sqm)_is_zero", "Land Size (sqm)_is_zero"):
+            if z in num_all and z not in num_cols:
+                num_cols.append(z)
     else:
         num_cols = [c for c in num_all if c not in _forbidden_logs]
         if "floor_to_bed_med" in num_all and "floor_to_bed_med" not in num_cols:
@@ -2374,13 +4048,49 @@ def train_model(
             num_cols.append("Bath")
         if "Garage Parks" in num_all and "Garage Parks" not in num_cols:
             num_cols.append("Garage Parks")
+        # ensure Suburb medians are kept
+        for suburb_med in (
+            "Suburb90dMedian",
+            "SuburbBed90dMedian",
+            "Suburb365dMedian",
+            "SuburbBed365dMedian",
+        ):
+            if suburb_med in num_all and suburb_med not in num_cols:
+                num_cols.append(suburb_med)
+        # ensure rec2 features are kept (RECENCY_V2)
+        if os.getenv("RECENCY_V2", "1").lower() in {"1", "true", "yes"}:
+            for rec2_feat in num_all:
+                if str(rec2_feat).startswith("rec2_") and rec2_feat not in num_cols:
+                    num_cols.append(rec2_feat)
+
+        # ensure key log numerics survive Top-K trimming
+        for pinned in (
+            "log_Floor Size (sqm)",
+            "log_Land Size (sqm)",
+            "log_Capital Value",
+            "log_Land Value",
+            "log_Improvement Value",
+        ):
+            if pinned in num_all and pinned not in num_cols:
+                num_cols.append(pinned)
+        # also keep zero indicators if present
+        for z in ("Floor Size (sqm)_is_zero", "Land Size (sqm)_is_zero"):
+            if z in num_all and z not in num_cols:
+                num_cols.append(z)
 
     # Optionally exclude all geo bearings from numeric block (user toggle)
     if EXCLUDE_GEO_BEARING:
         before_n = len(num_cols)
-        num_cols = [c for c in num_cols if not str(c).startswith("bearing_") and not str(c).startswith("log_bearing_")]
+        num_cols = [
+            c
+            for c in num_cols
+            if not str(c).startswith("bearing_")
+            and not str(c).startswith("log_bearing_")
+        ]
         if len(num_cols) != before_n:
-            logging.info("Excluded geo bearings from numeric features (EXCLUDE_GEO_BEARING=1)")
+            logging.info(
+                "Excluded geo bearings from numeric features (EXCLUDE_GEO_BEARING=1)"
+            )
 
     # Ensure critical geo features are always kept if present (prevents Top-K trimming)
     try:
@@ -2388,29 +4098,45 @@ def train_model(
             kept = []
             for key in ALWAYS_KEEP_GEO:
                 # exact match or suffix match (e.g., cnt_school_primary_4000m)
-                present = [c for c in num_all if str(c).lower() == key or str(c).lower().endswith(key)]
+                present = [
+                    c
+                    for c in num_all
+                    if str(c).lower() == key or str(c).lower().endswith(key)
+                ]
                 for c in present:
                     if c in num_all and c not in num_cols:
                         num_cols.append(c)
                         kept.append(c)
             if kept:
-                logging.info("Always-kept geo features: %s", ", ".join(sorted(set(map(str, kept)))))
+                logging.info(
+                    "Always-kept geo features: %s",
+                    ", ".join(sorted(set(map(str, kept)))),
+                )
     except Exception:
         pass
 
     num_cols = _filtered_numeric_columns(num_cols)
 
-    # Prefer log versions over raw for heavy‑tailed numerics to avoid duplicate signals
-    prefer_log_for = [s.strip() for s in os.getenv(
-        "PREFER_LOG_FOR",
-        "Capital Value,Land Size (sqm),Floor Size (sqm),Days on Market",
-    ).split(",") if s.strip()]
+    # Prefer log versions over raw for heavy-tailed numerics to avoid duplicate signals
+    prefer_log_for = [
+        s.strip()
+        for s in os.getenv(
+            "PREFER_LOG_FOR",
+            "Capital Value,Land Value,Improvement Value,Land Size (sqm),Floor Size (sqm),Days on Market",
+        ).split(",")
+        if s.strip()
+    ]
+    KEEP_RAW_WHEN_LOG = bool(int(os.getenv("KEEP_RAW_WHEN_LOG", "0")))
     for base in prefer_log_for:
         raw = base
         logn = f"log_{base}"
-        if raw in num_cols and logn in num_cols:
+        if raw in num_cols and logn in num_cols and not KEEP_RAW_WHEN_LOG:
             num_cols.remove(raw)
-    cat_cols = [c for c in feature_cols if c not in num_cols and not pd.api.types.is_numeric_dtype(train_df[c])]
+    cat_cols = [
+        c
+        for c in feature_cols
+        if c not in num_cols and not pd.api.types.is_numeric_dtype(train_df[c])
+    ]
     # Drop leak-prone, high-cardinality categoricals (configurable)
     try:
         if EXCLUDE_CAT_FEATURES:
@@ -2426,7 +4152,10 @@ def train_model(
     try:
         cat_cols, dropped_low_entropy = _drop_low_entropy_cats_df(train_df, cat_cols)
         if dropped_low_entropy:
-            logging.info("Dropped low-entropy categoricals: %s", ", ".join(sorted(dropped_low_entropy)))
+            logging.info(
+                "Dropped low-entropy categoricals: %s",
+                ", ".join(sorted(dropped_low_entropy)),
+            )
     except Exception:
         pass
 
@@ -2436,6 +4165,7 @@ def train_model(
         try:
             t_obj = joblib.load(TEACHER_PIPELINE)
             if isinstance(t_obj, dict) and "preprocessor" in t_obj and "model" in t_obj:
+
                 class _T:
                     def __init__(self, o):
                         self.pre = o["preprocessor"]
@@ -2461,12 +4191,16 @@ def train_model(
         cat_cols = _drop_raw_date_from_cats(list(cat_cols), date_col)
     except Exception:
         pass
-    preproc, cat_idx = build_preprocessor(train_df, num_cols, cat_cols, scale_numeric, date_col=date_col)
+    preproc, cat_idx = build_preprocessor(
+        train_df, num_cols, cat_cols, scale_numeric, date_col=date_col
+    )
     X_train = np.array(preproc.fit_transform(train_df[num_cols + cat_cols]), copy=False)
     X_early = np.array(preproc.transform(early_df[num_cols + cat_cols]), copy=False)
     X_test = np.array(preproc.transform(test_df[num_cols + cat_cols]), copy=False)
     cat_idx = _expand_cat_indices_for_strings(X_train, cat_idx)
     cat_idx = _clip_cat_indices(cat_idx, X_train.shape[1])
+    # Persist final categorical indices for serve-time Pool construction
+    cat_idx_final = list(cat_idx)
 
     y_train = train_df[target_col].to_numpy()
     y_early = early_df[target_col].to_numpy()
@@ -2478,7 +4212,9 @@ def train_model(
 
     # TRAIN-fit OutlierScorer and apply to all splits (assign by position to avoid duplicate-index joins)
     if ENABLE_OUTLIER_SCORER:
-        scorer = OutlierScorer(target_col=target_col, suburb_col=suburb_col, date_col=date_col).fit(train_df)
+        scorer = OutlierScorer(
+            target_col=target_col, suburb_col=suburb_col, date_col=date_col
+        ).fit(train_df)
         of_train = scorer.transform(train_df)
         of_early = scorer.transform(early_df)
         of_test = scorer.transform(test_df)
@@ -2491,8 +4227,49 @@ def train_model(
                 test_df[col] = of_test[col].to_numpy()
         # artifacts: per-split flags
         for nm, _df in (("train", train_df), ("early", early_df), ("test", test_df)):
-            _cols = [c for c in ["_outlier", "_z_resid", "_z_pps", target_col, suburb_col, date_col] if c in _df.columns]
-            (_df[_cols]).to_csv(ARTIFACT_DIR / f"outlier_flags_{nm}_{ds_hash}.csv", index=False)
+            _cols = [
+                c
+                for c in [
+                    "_outlier",
+                    "_z_resid",
+                    "_z_pps",
+                    target_col,
+                    suburb_col,
+                    date_col,
+                ]
+                if c in _df.columns
+            ]
+            (_df[_cols]).to_csv(
+                ARTIFACT_DIR / f"outlier_flags_{nm}_{ds_hash}.csv", index=False
+            )
+        # Always export a human-friendly TRAIN outliers CSV to plots/, including whether removed
+        try:
+            from plotting import save_dataframe_csv
+
+            cols = [
+                c
+                for c in [
+                    suburb_col,
+                    date_col,
+                    target_col,
+                    "Bed",
+                    "Bath",
+                    "Car",
+                    "_z_resid",
+                    "_z_pps",
+                    "_outlier",
+                ]
+                if c in train_df.columns
+            ]
+            outliers_df = train_df[cols].copy()
+            outliers_df["removed"] = bool(OUTLIER_DROP_TRAIN) & outliers_df[
+                "_outlier"
+            ].astype(bool)
+            save_dataframe_csv(
+                outliers_df, str(PLOTS_DIR), f"outliers_train_{ds_hash}.csv"
+            )
+        except Exception:
+            pass
     else:
         train_df["_outlier"] = False
         early_df["_outlier"] = False
@@ -2501,7 +4278,9 @@ def train_model(
     # Step 2: Optuna tuning on CV folds with fold-level outlier weighting
     # Prefer runtime GPU detection; fallback to env hints
     gpu_env = _gpu_available() or bool(
-        os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("NVIDIA_VISIBLE_DEVICES") or os.path.exists("/dev/nvidia0")
+        os.getenv("CUDA_VISIBLE_DEVICES")
+        or os.getenv("NVIDIA_VISIBLE_DEVICES")
+        or os.path.exists("/dev/nvidia0")
     )
     task_type = "GPU" if use_gpu and gpu_env else "CPU"
     if use_gpu and not gpu_env:
@@ -2533,34 +4312,113 @@ def train_model(
     )
 
     # Recompute CV metrics under best params for apples-to-apples drift checks
-    cv_metrics = {"CV_WMAE": float("nan"), "CV_WRMSE": float("nan"), "CV_MAE": float("nan"), "CV_RMSE": float("nan")}
+    cv_metrics = {
+        "CV_WMAE": float("nan"),
+        "CV_WRMSE": float("nan"),
+        "CV_MAE": float("nan"),
+        "CV_RMSE": float("nan"),
+    }
+    blend_head = None
     try:
         if cv_folds and len(cv_folds) >= 2:
             cv_true_all: list[np.ndarray] = []
             cv_pred_all: list[np.ndarray] = []
             cv_w_all: list[np.ndarray] = []
+            labels_all_local = make_block_labels(df[date_col])
             for tr_idx, va_idx in cv_folds:
                 df_fold = make_time_features(
-                    df, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
+                    df,
+                    tr_idx,
+                    date_col=date_col,
+                    target_col=target_col,
+                    suburb_col=suburb_col,
                 )
                 df_fold = _apply_feature_policy(df_fold)
-                feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_check(c)]
-                num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
+                feat_fold = [
+                    c
+                    for c in df_fold.columns
+                    if c not in (target_col, date_col) and not leak_check(c)
+                ]
+                num_cols_fold = [
+                    c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])
+                ]
                 cat_cols_fold = [c for c in feat_fold if c not in num_cols_fold]
                 num_cols_fold = _filtered_numeric_columns(num_cols_fold)
+                try:
+                    num_cols_fold = _drop_all_nan_columns(
+                        df_fold.iloc[tr_idx], num_cols_fold
+                    )
+                except Exception:
+                    pass
 
                 preproc_fold, cat_idx_fold = build_preprocessor(
-                    df_fold.iloc[tr_idx], num_cols_fold, cat_cols_fold, scale_numeric, date_col=date_col
+                    df_fold.iloc[tr_idx],
+                    num_cols_fold,
+                    cat_cols_fold,
+                    scale_numeric,
+                    date_col=date_col,
                 )
-                X_tr_f = np.array(preproc_fold.fit_transform(df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]), copy=False)
-                X_va_f = np.array(preproc_fold.transform(df_fold.iloc[va_idx][num_cols_fold + cat_cols_fold]), copy=False)
+                X_tr_f = np.array(
+                    preproc_fold.fit_transform(
+                        df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]
+                    ),
+                    copy=False,
+                )
+                X_va_f = np.array(
+                    preproc_fold.transform(
+                        df_fold.iloc[va_idx][num_cols_fold + cat_cols_fold]
+                    ),
+                    copy=False,
+                )
                 y_tr_f = df_fold.iloc[tr_idx][target_col].to_numpy()
                 y_va_f = df_fold.iloc[va_idx][target_col].to_numpy()
 
                 cap_tr_f = np.percentile(y_tr_f, 99.5)
                 w_va_f = make_weights(y_va_f, cap_tr_f)
 
-                params_eval = {**best_params, "task_type": task_type, "allow_writing_files": False, "loss_function": "RMSE", "eval_metric": "RMSE"}
+                # Remove non-CB keys (e.g., 'halflife_days') before constructing CatBoost
+                _bp_eval = {
+                    k: v for k, v in best_params.items() if k != "halflife_days"
+                }
+                params_eval = {
+                    **_bp_eval,
+                    "task_type": task_type,
+                    "allow_writing_files": False,
+                    "loss_function": "RMSE",
+                    "eval_metric": "RMSE",
+                }
+                try:
+                    mono_cv2 = _mono_from_env(num_cols_fold)
+                    if mono_cv2 is not None:
+                        params_eval["monotone_constraints"] = mono_cv2
+                        if MONO_DEBUG:
+                            try:
+                                from mono_debug import append_mono_map  # type: ignore
+
+                                append_mono_map(
+                                    artifacts_dir=str(ARTIFACT_DIR),
+                                    tag="cv_metrics",
+                                    fold=int(fold_no),
+                                    features=[str(c) for c in num_cols_fold],
+                                    constraints=[int(x) for x in mono_cv2],
+                                )
+                            except Exception:
+                                pass
+                    elif MONO_DEBUG:
+                        try:
+                            from mono_debug import append_mono_map  # type: ignore
+
+                            append_mono_map(
+                                artifacts_dir=str(ARTIFACT_DIR),
+                                tag="cv_metrics",
+                                fold=int(fold_no),
+                                features=[str(c) for c in num_cols_fold],
+                                constraints=[0 for _ in num_cols_fold],
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 model_f = CatBoostRegressor(**params_eval)
                 model_f.fit(
                     X_tr_f,
@@ -2575,26 +4433,73 @@ def train_model(
                 cv_true_all.append(y_va_f)
                 cv_pred_all.append(y_pred_va)
                 cv_w_all.append(w_va_f)
+                # Per-fold WMAE and month label snapshot
+                try:
+                    _wmae_f = float(
+                        np.sum(w_va_f * np.abs(y_va_f - y_pred_va))
+                        / max(np.sum(w_va_f), 1e-9)
+                    )
+                    _mlab = int(np.max(labels_all_local[va_idx])) if len(va_idx) else -1
+                    cv_fold_rows.append(
+                        {
+                            "fold": int(len(cv_fold_rows) + 1),
+                            "month_label": _mlab,
+                            "WMAE": _wmae_f,
+                        }
+                    )
+                except Exception:
+                    pass
 
-            y_cv_true = np.concatenate(cv_true_all)
-            y_cv_pred = np.concatenate(cv_pred_all)
-            w_cv = np.concatenate(cv_w_all)
-            cv_metrics["CV_MAE"] = float(np.mean(np.abs(y_cv_true - y_cv_pred)))
-            try:
-                cv_metrics["CV_RMSE"] = float(mean_squared_error(y_cv_true, y_cv_pred, squared=False))
-            except TypeError:
-                cv_metrics["CV_RMSE"] = float(np.sqrt(mean_squared_error(y_cv_true, y_cv_pred)))
-            cv_metrics["CV_WMAE"] = float(np.sum(w_cv * np.abs(y_cv_true - y_cv_pred)) / np.sum(w_cv))
-            cv_metrics["CV_WRMSE"] = float(np.sqrt(np.sum(w_cv * (y_cv_true - y_cv_pred) ** 2) / np.sum(w_cv)))
+            # Streaming CV metrics (avoid full concatenation to prevent memory spikes)
+            _cv_abs_sum = 0.0
+            _cv_sq_sum = 0.0
+            _cv_w_abs_sum = 0.0
+            _cv_w_sq_sum = 0.0
+            _cv_w_sum = 0.0
+            _cv_n = 0
+            for yt, yp, ww in zip(cv_true_all, cv_pred_all, cv_w_all):
+                y = np.asarray(yt, dtype=np.float32)
+                p = np.asarray(yp, dtype=np.float32)
+                w = np.asarray(ww, dtype=np.float32)
+                m = np.isfinite(y) & np.isfinite(p) & np.isfinite(w)
+                if not m.any():
+                    continue
+                y = y[m]
+                p = p[m]
+                w = w[m]
+                _cv_abs_sum += float(np.sum(np.abs(y - p)))
+                _cv_sq_sum += float(np.sum((y - p) ** 2))
+                _cv_w_abs_sum += float(np.sum(w * np.abs(y - p)))
+                _cv_w_sq_sum += float(np.sum(w * (y - p) ** 2))
+                _cv_w_sum += float(np.sum(w))
+                _cv_n += y.shape[0]
+            if _cv_n > 0:
+                cv_metrics["CV_MAE"] = float(_cv_abs_sum / _cv_n)
+                cv_metrics["CV_RMSE"] = float(np.sqrt(_cv_sq_sum / _cv_n))
+            if _cv_w_sum > 0:
+                cv_metrics["CV_WMAE"] = float(_cv_w_abs_sum / _cv_w_sum)
+                cv_metrics["CV_WRMSE"] = float(np.sqrt(_cv_w_sq_sum / _cv_w_sum))
     except Exception as _cve:
         logging.warning("CV metrics computation skipped: %s", _cve)
+
+    # Save CV fold metrics to CSV if populated
+    try:
+        if cv_fold_rows:
+            folds_df = pd.DataFrame(cv_fold_rows)
+            _folds_path = ARTIFACT_DIR / f"folds_{ds_hash}.csv"
+            folds_df.to_csv(_folds_path, index=False)
+            folds_csv_path = str(_folds_path)
+    except Exception as _fe:
+        logging.warning("Saving folds CSV failed: %s", _fe)
 
     # If no block CV, synthesize simple rolling folds for CV metrics
     if (not cv_folds) or len(cv_folds) < 2:
         try:
             labels_all = make_block_labels(df[date_col])
             cv_folds = make_walk_folds(labels_all, gap_months=0)
-            cv_folds = apply_gap_days(cv_folds, df[date_col], GAP_DAYS if GAP_DAYS > 0 else 0)
+            cv_folds = apply_gap_days(
+                cv_folds, df[date_col], GAP_DAYS if GAP_DAYS > 0 else 0
+            )
         except Exception:
             cv_folds = []
     # Final safety: if still empty, use a simple chronological TimeSeriesSplit
@@ -2608,17 +4513,28 @@ def train_model(
     oof_r2 = None
     oof_r2_log = None
     if cv_folds and len(cv_folds) >= 2:
+        ridge_oof = None
         try:
             oof_y_true_list: list[np.ndarray] = []
             oof_y_pred_list: list[np.ndarray] = []
             for fold_no, (tr_idx, val_idx) in enumerate(cv_folds, 1):
                 df_fold = make_time_features(
-                    df, tr_idx, date_col=date_col, target_col=target_col, suburb_col=suburb_col
+                    df,
+                    tr_idx,
+                    date_col=date_col,
+                    target_col=target_col,
+                    suburb_col=suburb_col,
                 )
                 df_fold = _apply_feature_policy(df_fold)
 
-                feat_fold = [c for c in df_fold.columns if c not in (target_col, date_col) and not leak_check(c)]
-                num_cols_fold = [c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])]
+                feat_fold = [
+                    c
+                    for c in df_fold.columns
+                    if c not in (target_col, date_col) and not leak_check(c)
+                ]
+                num_cols_fold = [
+                    c for c in feat_fold if pd.api.types.is_numeric_dtype(df_fold[c])
+                ]
                 cat_cols_fold = [c for c in feat_fold if c not in num_cols_fold]
 
                 TOP_K_CV = int(os.getenv("CV_TOPK_NUM", "18"))
@@ -2626,20 +4542,31 @@ def train_model(
                     try:
                         tgt_log_cv = np.log1p(df_fold.iloc[tr_idx][target_col])
                         corrs_fold = (
-                            df_fold.iloc[tr_idx][num_cols_fold].corrwith(tgt_log_cv).abs().fillna(0)
+                            df_fold.iloc[tr_idx][num_cols_fold]
+                            .corrwith(tgt_log_cv)
+                            .abs()
+                            .fillna(0)
                         )
-                        num_cols_fold = list(corrs_fold.sort_values(ascending=False).head(TOP_K_CV).index)
+                        num_cols_fold = list(
+                            corrs_fold.sort_values(ascending=False).head(TOP_K_CV).index
+                        )
                     except Exception:
                         pass
 
                 num_cols_fold = _filtered_numeric_columns(num_cols_fold)
 
                 preproc_fold, cat_idx_fold = build_preprocessor(
-                    df_fold.iloc[tr_idx], num_cols_fold, cat_cols_fold, scale_numeric, date_col=date_col
+                    df_fold.iloc[tr_idx],
+                    num_cols_fold,
+                    cat_cols_fold,
+                    scale_numeric,
+                    date_col=date_col,
                 )
 
-                X_tr_f = np.array(preproc_fold.fit_transform(df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]), copy=False)
-                X_va_f = np.array(preproc_fold.transform(df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold]), copy=False)
+                _df_tr = df_fold.iloc[tr_idx][num_cols_fold + cat_cols_fold]
+                _df_va = df_fold.iloc[val_idx][num_cols_fold + cat_cols_fold]
+                X_tr_f = np.array(preproc_fold.fit_transform(_df_tr), copy=False)
+                X_va_f = np.array(preproc_fold.transform(_df_va), copy=False)
                 cat_idx_fold = _expand_cat_indices_for_strings(X_tr_f, cat_idx_fold)
                 cat_idx_fold = _clip_cat_indices(cat_idx_fold, X_tr_f.shape[1])
                 y_tr_f = df_fold.iloc[tr_idx][target_col].to_numpy()
@@ -2650,14 +4577,33 @@ def train_model(
                 w_tr_f = make_weights(y_tr_f, cap_tr_f)
                 if ENABLE_OUTLIER_SCORER:
                     try:
-                        scorer_f = OutlierScorer(target_col=target_col, suburb_col=suburb_col, date_col=date_col).fit(df_fold.iloc[tr_idx])
-                        flags_tr_f = scorer_f.transform(df_fold.iloc[tr_idx])["_outlier"].to_numpy()
+                        scorer_f = OutlierScorer(
+                            target_col=target_col,
+                            suburb_col=suburb_col,
+                            date_col=date_col,
+                        ).fit(df_fold.iloc[tr_idx])
+                        flags_tr_f = scorer_f.transform(df_fold.iloc[tr_idx])[
+                            "_outlier"
+                        ].to_numpy()
                         w_tr_f = w_tr_f * np.where(flags_tr_f, OUTLIER_WEIGHT_MULT, 1.0)
                     except Exception:
                         pass
 
                 _bp = {k: v for k, v in best_params.items() if k != "halflife_days"}
-                model_f = CatBoostRegressor(**{**_bp, "task_type": task_type, "allow_writing_files": False})
+                # Align monotone constraints inside CV with final-fit behavior
+                try:
+                    mono_cv = _mono_from_env(num_cols_fold)
+                except Exception:
+                    mono_cv = None
+                _params_cv = {
+                    **_bp,
+                    "task_type": task_type,
+                    "allow_writing_files": False,
+                }
+                # Monotone constraints only on CPU
+                if mono_cv is not None and str(task_type).upper() != "GPU":
+                    _params_cv["monotone_constraints"] = mono_cv
+                model_f = CatBoostRegressor(**_params_cv)
                 model_f.fit(
                     X_tr_f,
                     np.log1p(y_tr_f),
@@ -2668,33 +4614,128 @@ def train_model(
                     use_best_model=True,
                     verbose=False,
                 )
+                if LOG_CV_CURVES:
+                    try:
+                        tno = getattr(trial, "number", None)
+                        lbl = (
+                            f"trial{tno}_fold{fold_no}"
+                            if tno is not None
+                            else f"fold{fold_no}"
+                        )
+                        path = ARTIFACT_DIR / f"curves_cv_{lbl}.csv"
+                        _save_cb_curve(
+                            model_f, path, label=lbl, sample_every=LOG_CURVES_EVERY
+                        )
+                    except Exception:
+                        pass
                 y_pred_va = _safe_expm1(model_f.predict(X_va_f))
                 oof_y_true_list.append(y_va_f)
                 oof_y_pred_list.append(y_pred_va)
+                # Ridge fold OOF aligned to the same validation segment
+                if TRAIN_RIDGE:
+                    try:
+                        df_tr_df = _df_tr.copy()
+                        y_tr_full = y_tr_f
+                        # Optional: restrict Ridge training to Bed >= RIDGE_MIN_BED
+                        if RIDGE_MIN_BED > 0 and "Bed" in df_tr_df.columns:
+                            bed_series = pd.to_numeric(df_tr_df["Bed"], errors="coerce")
+                            mask = (
+                                (bed_series >= RIDGE_MIN_BED).fillna(False).to_numpy()
+                            )
+                            if mask.sum() >= 20:
+                                df_tr_df = df_tr_df[mask]
+                                y_tr_full = y_tr_full[mask]
+                                logging.debug(
+                                    "Ridge fold %d: training on Bed ≥ %d (rows=%d)",
+                                    int(fold_no),
+                                    RIDGE_MIN_BED,
+                                    int(mask.sum()),
+                                )
+                            else:
+                                logging.info(
+                                    "Ridge OOF: insufficient rows for Bed ≥ %d (got %d); using all rows",
+                                    RIDGE_MIN_BED,
+                                    int(mask.sum()),
+                                )
+                        # Identify categorical indices after preproc
+                        cat_cols_for_encoding = [
+                            i for i in cat_idx_fold if i < X_tr_f.shape[1]
+                        ]
+                        # Build unified DF-in Ridge with embedded preprocessor
+                        ridge_fold_pipe = _build_ridge_with_preproc(
+                            preproc=preproc_fold
+                        )
+                        ridge_fold_pipe.fit(df_tr_df, y_tr_full)
+                        # Predict on validation directly from engineered DataFrame
+                        ridge_va = ridge_fold_pipe.predict(_df_va)
+                        # initialize accumulator if not present
+                        try:
+                            ridge_pred_list
+                        except NameError:
+                            ridge_pred_list = []
+                        ridge_pred_list.append(np.asarray(ridge_va, float).reshape(-1))
+                    except Exception as _rerr:
+                        logging.warning("Ridge fold OOF skipped: %s", _rerr)
 
-            y_oof = np.concatenate(oof_y_true_list)
-            yhat_oof = np.concatenate(oof_y_pred_list)
-            oof_r2 = float(r2_score(y_oof, yhat_oof))
+            # (removed deprecated separate Ridge OOF pass; now computed fold-synchronously)
+
+            # Streaming OOF metrics (robust to memory pressure)
+            _oof_stats = _oof_metrics_from_parts(oof_y_true_list, oof_y_pred_list)
+            oof_r2, oof_r2_log = _oof_stats["r2"], _oof_stats["r2_log"]
+            # OOF metrics computed via streaming above; avoid materializing full OOF arrays
+            # oof_r2 computed via streaming above
             # Log-scale R² (guard against negatives)
-            y_oof_log = np.log1p(y_oof)
-            yhat_oof_log = np.log1p(np.clip(yhat_oof, a_min=0.0, a_max=None))
-            oof_r2_log = float(r2_score(y_oof_log, yhat_oof_log))
+            # y_oof_log computed via streaming; skip materialization
+            # yhat_oof_log computed via streaming; skip materialization
+            # oof_r2_log computed via streaming above
+
+            # --- Learn non-negative blend weights on OOF (CatBoost [+ Ridge]) ---
+            try:
+                rc_parts = (
+                    ridge_pred_list
+                    if "ridge_pred_list" in locals() and len(ridge_pred_list) > 0
+                    else None
+                )
+                mask_parts = None
+                try:
+                    ridge_min_env = int(os.getenv("RIDGE_MIN_BED", str(RIDGE_MIN_BED)))
+                except Exception:
+                    ridge_min_env = RIDGE_MIN_BED
+                if rc_parts is not None and ridge_min_env > 0 and ("Bed" in df.columns):
+                    bed_all = pd.to_numeric(df["Bed"], errors="coerce").to_numpy()
+                    bed_seq = [bed_all[_va] for _, _va in cv_folds]
+                    mask_parts = [
+                        (np.isfinite(b) & (b >= ridge_min_env)) for b in bed_seq
+                    ]
+                labels, w = _nnls_2col_from_stream(
+                    oof_y_pred_list, rc_parts, oof_y_true_list, mask_parts
+                )
+                w = np.asarray(w, float)
+                w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+                if w.sum() == 0:
+                    labels, w = ["CatBoost"], np.array([1.0], float)
+                blend_head = {"labels": labels, "weights": w.tolist()}
+                logging.info(
+                    "Blend-head learned: %s",
+                    dict(zip(labels, [round(x, 3) for x in w.tolist()])),
+                )
+            except Exception as e:
+                logging.warning("Blend-head skipped: %s", e)
             logging.info("OOF R² (orig): %.3f | OOF R² (log): %.3f", oof_r2, oof_r2_log)
 
-            # Fallback CV metrics from OOF aggregates if missing
+            # Fallback CV metrics from streaming OOF aggregates if missing
             try:
-                cap_oof = np.percentile(y_oof, 99.5)
-                if not np.isfinite(cap_oof) or cap_oof <= 0:
-                    cap_oof = float(np.nanmax(y_oof)) if np.isfinite(np.nanmax(y_oof)) else 1.0
-                w_oof = make_weights(y_oof, cap_oof)
+                _oof_stats = _oof_metrics_from_parts(oof_y_true_list, oof_y_pred_list)
                 if not np.isfinite(cv_metrics.get("CV_WMAE", np.nan)):
-                    cv_metrics["CV_WMAE"] = float(np.sum(w_oof * np.abs(y_oof - yhat_oof)) / np.sum(w_oof))
+                    cv_metrics["CV_WMAE"] = float(_oof_stats.get("wmae", float("nan")))
                 if not np.isfinite(cv_metrics.get("CV_MAE", np.nan)):
-                    cv_metrics["CV_MAE"] = float(np.mean(np.abs(y_oof - yhat_oof)))
+                    cv_metrics["CV_MAE"] = float(_oof_stats.get("mae", float("nan")))
                 if not np.isfinite(cv_metrics.get("CV_RMSE", np.nan)):
-                    cv_metrics["CV_RMSE"] = float(np.sqrt(np.mean((y_oof - yhat_oof) ** 2)))
+                    cv_metrics["CV_RMSE"] = float(_oof_stats.get("rmse", float("nan")))
                 if not np.isfinite(cv_metrics.get("CV_WRMSE", np.nan)):
-                    cv_metrics["CV_WRMSE"] = float(np.sqrt(np.sum(w_oof * (y_oof - yhat_oof) ** 2) / np.sum(w_oof)))
+                    cv_metrics["CV_WRMSE"] = float(
+                        _oof_stats.get("wrmse", float("nan"))
+                    )
             except Exception:
                 pass
         except Exception as e:
@@ -2705,34 +4746,65 @@ def train_model(
     try:
         _cap_tr_snap = np.percentile(y_train, 99.5)
         if not np.isfinite(_cap_tr_snap) or _cap_tr_snap <= 0:
-            _cap_tr_snap = float(np.nanmax(y_train)) if np.isfinite(np.nanmax(y_train)) else 1.0
-        _w_train_snap = make_weights(y_train, _cap_tr_snap, scheme=os.getenv("WEIGHT_SCHEME", "inv_sqrt"))
-        _snap_model = CatBoostRegressor(**{**best_params, "task_type": task_type, "allow_writing_files": False})
-        _snap_model.fit(X_train, np.log1p(y_train), sample_weight=_w_train_snap, cat_features=cat_idx, verbose=False)
+            _cap_tr_snap = (
+                float(np.nanmax(y_train)) if np.isfinite(np.nanmax(y_train)) else 1.0
+            )
+        _w_train_snap = make_weights(
+            y_train, _cap_tr_snap, scheme=os.getenv("WEIGHT_SCHEME", "inv_sqrt")
+        )
+        _bp_snap = {k: v for k, v in best_params.items() if k != "halflife_days"}
+        _snap_model = CatBoostRegressor(
+            **{**_bp_snap, "task_type": task_type, "allow_writing_files": False}
+        )
+        _snap_model.fit(
+            X_train,
+            np.log1p(y_train),
+            sample_weight=_w_train_snap,
+            cat_features=cat_idx,
+            verbose=False,
+        )
         _pre_early = _safe_expm1(_snap_model.predict(X_early))
         _pre_test = _safe_expm1(_snap_model.predict(X_test))
         _pre_early_mae = mean_absolute_error(y_early, _pre_early)
         _pre_test_mae = mean_absolute_error(y_test, _pre_test)
         _cap_early_snap = np.percentile(y_early, 99.5) if y_early.size else 1.0
         if not np.isfinite(_cap_early_snap) or _cap_early_snap <= 0:
-            _cap_early_snap = float(np.nanmax(y_early)) if y_early.size and np.isfinite(np.nanmax(y_early)) else 1.0
+            _cap_early_snap = (
+                float(np.nanmax(y_early))
+                if y_early.size and np.isfinite(np.nanmax(y_early))
+                else 1.0
+            )
         _pre_early_w = make_weights(y_early, _cap_early_snap)
-        _pre_early_wmae = float(np.sum(_pre_early_w * np.abs(y_early - _pre_early)) / max(np.sum(_pre_early_w), 1e-9))
+        _pre_early_wmae = float(
+            np.sum(_pre_early_w * np.abs(y_early - _pre_early))
+            / max(np.sum(_pre_early_w), 1e-9)
+        )
         _cap_test_snap = np.percentile(y_test, 99.5) if y_test.size else 1.0
         if not np.isfinite(_cap_test_snap) or _cap_test_snap <= 0:
-            _cap_test_snap = float(np.nanmax(y_test)) if y_test.size and np.isfinite(np.nanmax(y_test)) else 1.0
+            _cap_test_snap = (
+                float(np.nanmax(y_test))
+                if y_test.size and np.isfinite(np.nanmax(y_test))
+                else 1.0
+            )
         _pre_test_w = make_weights(y_test, _cap_test_snap)
-        _pre_test_wmae = float(np.sum(_pre_test_w * np.abs(y_test - _pre_test)) / np.sum(_pre_test_w))
+        _pre_test_wmae = float(
+            np.sum(_pre_test_w * np.abs(y_test - _pre_test)) / np.sum(_pre_test_w)
+        )
         logging.info(
             "Pre-final-fit snapshot | EARLY-MAE %.3f | EARLY-wMAE %.3f | TEST-MAE %.3f | TEST-wMAE %.3f (TRAIN only)",
-            _pre_early_mae, _pre_early_wmae, _pre_test_mae, _pre_test_wmae
+            _pre_early_mae,
+            _pre_early_wmae,
+            _pre_test_mae,
+            _pre_test_wmae,
         )
     except Exception:
         pass
     logging.info("Step 3/6 – final fit")
     cap_global = np.percentile(y_train, 99.5)
     if not np.isfinite(cap_global) or cap_global <= 0:
-        cap_global = float(np.nanmax(y_train)) if np.isfinite(np.nanmax(y_train)) else 1.0
+        cap_global = (
+            float(np.nanmax(y_train)) if np.isfinite(np.nanmax(y_train)) else 1.0
+        )
 
     # Base weights
     w_scheme = os.getenv("WEIGHT_SCHEME", "inv_sqrt")
@@ -2741,17 +4813,49 @@ def train_model(
         w_scheme = "uniform"
     w_train = make_weights(y_train, cap_global, scheme=w_scheme)
     w_early = make_weights(y_early, cap_global, scheme=w_scheme)
+    # Tail-aware upweight (TRAIN/EARLY only; never applied on TEST metrics)
+    try:
+        w_train = (w_train * np.where(y_train > TAIL_THRESH, TAIL_MULT, 1.0)).astype(
+            np.float32
+        )
+        if y_early.size:
+            w_early = (
+                w_early * np.where(y_early > TAIL_THRESH, TAIL_MULT, 1.0)
+            ).astype(np.float32)
+    except Exception:
+        pass
 
     # Outlier down-weighting
     if ENABLE_OUTLIER_SCORER:
-        flags_train_arr = train_df["_outlier"].reindex(idx_train).fillna(False).to_numpy()
-        flags_early_arr = early_df["_outlier"].reindex(idx_early).fillna(False).to_numpy()
+        flags_train_arr = (
+            train_df["_outlier"].reindex(idx_train).fillna(False).to_numpy()
+        )
+        flags_early_arr = (
+            early_df["_outlier"].reindex(idx_early).fillna(False).to_numpy()
+        )
         w_train = w_train * np.where(flags_train_arr, OUTLIER_WEIGHT_MULT, 1.0)
         w_early = w_early * np.where(flags_early_arr, OUTLIER_WEIGHT_MULT, 1.0)
 
     # Optional: drop outliers on TRAIN (keeps EARLY weighted)
     if ENABLE_OUTLIER_SCORER and OUTLIER_DROP_TRAIN:
         keep = ~train_df["_outlier"].astype(bool).to_numpy()
+        # Export dropped outliers to plots
+        try:
+            from plotting import save_dataframe_csv
+
+            dropped = train_df.loc[
+                ~keep,
+                [
+                    c
+                    for c in [suburb_col, date_col, target_col, "Bed", "Bath", "Car"]
+                    if c in train_df.columns
+                ],
+            ].copy()
+            save_dataframe_csv(
+                dropped, str(PLOTS_DIR), f"removed_outliers_train_{ds_hash}.csv"
+            )
+        except Exception:
+            pass
         X_train = X_train[keep]
         y_train = y_train[keep]
         w_train = w_train[keep]
@@ -2759,7 +4863,11 @@ def train_model(
 
     # Combine TRAIN+EARLY for final model if desired
     if final_fit_on_all is None:
-        TRAIN_ONLY = os.getenv("TRAIN_ONLY_FINAL_FIT", "1").lower() in {"1", "true", "yes"}
+        TRAIN_ONLY = os.getenv("TRAIN_ONLY_FINAL_FIT", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     else:
         TRAIN_ONLY = not bool(final_fit_on_all)
     if TRAIN_ONLY:
@@ -2769,7 +4877,11 @@ def train_model(
         w_final = w_train
         early_in_train = False
     else:
-        X_final = sp.vstack([X_train, X_early]) if sp.issparse(X_train) else np.concatenate([X_train, X_early])
+        X_final = (
+            sp.vstack([X_train, X_early])
+            if sp.issparse(X_train)
+            else np.concatenate([X_train, X_early])
+        )
         y_final = np.log1p(np.concatenate([y_train, y_early]))
         eval_X, eval_y, eval_w = X_test, np.log1p(y_test), None
         w_final = np.concatenate([w_train, w_early])
@@ -2779,7 +4891,14 @@ def train_model(
     # Force RMSE on GPU (MAE not implemented). On CPU, honor FINAL_OBJECTIVE when set,
     # otherwise use MAE for MAE/wMAE tuning or RMSE by default.
     # Final objective to monitor; training stays on log-target with RMSE
-    _final_loss = "MAE" if (os.getenv("FINAL_OBJECTIVE", "").lower() == "mae" or opt_loss.lower() in {"mae","wmae"}) else "RMSE"
+    _final_loss = (
+        "MAE"
+        if (
+            os.getenv("FINAL_OBJECTIVE", "").lower() == "mae"
+            or opt_loss.lower() in {"mae", "wmae"}
+        )
+        else "RMSE"
+    )
     # Monotonic constraints derived from env (fallback to legacy when flag set)
     mono_final = _mono_from_env(num_cols)
     if mono_final is None and ENFORCE_MONOTONE:
@@ -2791,7 +4910,11 @@ def train_model(
 
     # Choose base params for final fit: tuned vs production baseline (toggle via FINAL_USE_TUNED)
     _final_use_tuned = os.getenv("FINAL_USE_TUNED", "0").lower() in {"1", "true", "yes"}
-    _base_final = dict(best_params) if _final_use_tuned and isinstance(best_params, dict) else dict(BEST_PARAMS_PRODUCTION)
+    _base_final = (
+        dict(best_params)
+        if _final_use_tuned and isinstance(best_params, dict)
+        else dict(BEST_PARAMS_PRODUCTION)
+    )
 
     # Use chosen baseline for final fit
     final_params = {
@@ -2799,7 +4922,12 @@ def train_model(
         # Train with RMSE on log-target for hardware invariance; monitor requested metric
         "loss_function": "RMSE",
         "eval_metric": _final_loss,
-        **({"monotone_constraints": mono_final} if mono_final is not None else {}),
+        # Apply monotone constraints only on CPU to avoid GPU limitation
+        **(
+            {"monotone_constraints": mono_final}
+            if (mono_final is not None and str(task_type).upper() != "GPU")
+            else {}
+        ),
         "random_seed": RANDOM_STATE,
         "task_type": task_type,
         "allow_writing_files": False,
@@ -2817,12 +4945,16 @@ def train_model(
         it = int(final_params.get("iterations", 2000))
         final_params["iterations"] = int(min(MAX_FINAL_ITER, it))
     except Exception:
-        final_params["iterations"] = min(final_params.get("iterations", 2000), MAX_FINAL_ITER)
+        final_params["iterations"] = min(
+            final_params.get("iterations", 2000), MAX_FINAL_ITER
+        )
     if task_type == "CPU":
         final_params["leaf_estimation_method"] = "Gradient"
         # For small training sets, disable subsampling to avoid CatBoost sampling errors
         try:
-            n_train_final = X_train.shape[0] + (X_early.shape[0] if early_in_train else 0)
+            n_train_final = X_train.shape[0] + (
+                X_early.shape[0] if early_in_train else 0
+            )
             if int(n_train_final) < 300:
                 final_params["bootstrap_type"] = "No"
                 final_params.pop("subsample", None)
@@ -2856,44 +4988,61 @@ def train_model(
     if TIME_DECAY_HALFLIFE_DAYS > 0:
         try:
             ref_dt_final = pd.to_datetime(train_df[date_col]).max()
-            w_train = w_train * _recency_weights(train_df[date_col], ref_dt_final, TIME_DECAY_HALFLIFE_DAYS)
-            w_early = w_early * _recency_weights(early_df[date_col], ref_dt_final, TIME_DECAY_HALFLIFE_DAYS)
-            w_final = w_train if not early_in_train else np.concatenate([w_train, w_early])
+            w_train = w_train * _recency_weights(
+                train_df[date_col], ref_dt_final, TIME_DECAY_HALFLIFE_DAYS
+            )
+            w_early = w_early * _recency_weights(
+                early_df[date_col], ref_dt_final, TIME_DECAY_HALFLIFE_DAYS
+            )
+            w_final = (
+                w_train if not early_in_train else np.concatenate([w_train, w_early])
+            )
         except Exception:
             pass
 
     # Optional: importance-weighted final fit (mitigate drift)
     domain_importance = {"enabled": False}
-    try:
-        if ENABLE_IMPORTANCE_WEIGHTED_FIT:
-            try:
-                _adv_for_iw = _adversarial_auc(X_train, X_early, X_test)
-            except Exception:
-                _adv_for_iw = None
-            if (_adv_for_iw is not None) and (_adv_for_iw >= IW_ENABLE_ON_ADV_AUC):
-                w_tr_iw, w_ea_iw = _domain_importance_weights(
-                    X_train, X_early, X_test, clip=(IW_CLIP_LOW, IW_CLIP_HIGH), temperature=IW_TEMP
+    if ENABLE_IMPORTANCE_WEIGHTED_FIT:
+        try:
+            adv_for_iw, w_tr_raw, w_ea_raw = _adversarial_auc_and_weights(
+                X_train, X_early, X_test
+            )
+            domain_importance["adv_auc"] = float(adv_for_iw)
+            if adv_for_iw >= IW_ENABLE_ON_ADV_AUC:
+                w_tr_iw = _rescale_importance_weights(
+                    w_tr_raw, clip=(IW_CLIP_LOW, IW_CLIP_HIGH), temperature=IW_TEMP
                 )
-                w_train = w_train * w_tr_iw
-                if early_in_train:
-                    w_early = w_early * w_ea_iw
-                w_final = w_train if not early_in_train else np.concatenate([w_train, w_early])
-                domain_importance = {
-                    "enabled": True,
-                    "clip": [float(IW_CLIP_LOW), float(IW_CLIP_HIGH)],
-                    "temperature": float(IW_TEMP),
-                    "mean_weight": float(np.mean(w_final)),
-                    "adv_auc": float(_adv_for_iw),
-                }
-                logging.info("Importance-weighted fit enabled (mean w=%.3f)", domain_importance["mean_weight"])
-    except Exception as e:
-        logging.warning("Importance weighting skipped: %s", e)
+                w_train = (w_train * w_tr_iw).astype(np.float32, copy=False)
+                if early_in_train and w_ea_raw is not None and len(w_ea_raw):
+                    w_ea_iw = _rescale_importance_weights(
+                        w_ea_raw, clip=(IW_CLIP_LOW, IW_CLIP_HIGH), temperature=IW_TEMP
+                    )
+                    w_early = (w_early * w_ea_iw).astype(np.float32, copy=False)
+                w_final = (
+                    w_train
+                    if not early_in_train
+                    else np.concatenate([w_train, w_early])
+                )
+                domain_importance.update(
+                    {
+                        "enabled": True,
+                        "clip": [float(IW_CLIP_LOW), float(IW_CLIP_HIGH)],
+                        "temperature": float(IW_TEMP),
+                        "mean_weight": float(np.mean(w_final)),
+                    }
+                )
+                logging.info(
+                    "Importance-weighted fit enabled (mean w=%.3f)",
+                    domain_importance["mean_weight"],
+                )
+        except Exception as e:
+            logging.warning("Importance weighting skipped: %s", e)
 
     # If optimizing RMSE, reduce outlier down-weighting impact in final fitting stage
     if os.getenv("FINAL_OBJECTIVE", "").lower() == "rmse" and ENABLE_OUTLIER_SCORER:
         try:
             w_final = np.asarray(w_final, dtype=float)
-            w_final = np.clip(w_final, np.min(w_final)*0.9, np.max(w_final))
+            w_final = np.clip(w_final, np.min(w_final) * 0.9, np.max(w_final))
         except Exception:
             pass
 
@@ -2926,8 +5075,17 @@ def train_model(
             # y_final is on log scale; convert back when applicable
             y_final_orig = np.expm1(y_final) if np.any(y_final < 40) else y_train
             for a in QUANTILE_ALPHAS:
-                qp = {k: v for k, v in final_params.items() if k not in {"loss_function", "eval_metric", "monotone_constraints"}}
-                qp.update({"loss_function": f"Quantile:alpha={float(a)}", "eval_metric": f"Quantile:alpha={float(a)}"})
+                qp = {
+                    k: v
+                    for k, v in final_params.items()
+                    if k not in {"loss_function", "eval_metric", "monotone_constraints"}
+                }
+                qp.update(
+                    {
+                        "loss_function": f"Quantile:alpha={float(a)}",
+                        "eval_metric": f"Quantile:alpha={float(a)}",
+                    }
+                )
                 qb = CatBoostRegressor(**qp)
                 qb.fit(
                     np.array(X_final, copy=False),
@@ -2937,16 +5095,29 @@ def train_model(
                     verbose=False,
                 )
                 q_models[float(a)] = qb
-                q_path = ARTIFACT_DIR / f"pipeline_q{int(round(float(a)*100))}_{ds_hash}.joblib"
+                q_path = (
+                    ARTIFACT_DIR
+                    / f"pipeline_q{int(round(float(a)*100))}_{ds_hash}.joblib"
+                )
                 joblib.dump({"preprocessor": preproc, "model": qb}, q_path, compress=3)
+                _duplicate_artifact(q_path)
                 q_paths[str(float(a))] = str(q_path)
-            if ENABLE_CQR and (y_early.size > 0) and any(a < 0.5 for a in QUANTILE_ALPHAS) and any(a > 0.5 for a in QUANTILE_ALPHAS):
+            if (
+                ENABLE_CQR
+                and (y_early.size > 0)
+                and any(a < 0.5 for a in QUANTILE_ALPHAS)
+                and any(a > 0.5 for a in QUANTILE_ALPHAS)
+            ):
                 a_lo = max(a for a in QUANTILE_ALPHAS if a < 0.5)
                 a_hi = min(a for a in QUANTILE_ALPHAS if a > 0.5)
                 qlo = q_models[float(a_lo)].predict(X_early)
                 qhi = q_models[float(a_hi)].predict(X_early)
                 qhat = _cqr_qhat(y_early, qlo, qhi, alpha=PI_ALPHA)
-                cqr = {"alpha_pair": [float(a_lo), float(a_hi)], "pi_alpha": PI_ALPHA, "qhat": float(qhat)}
+                cqr = {
+                    "alpha_pair": [float(a_lo), float(a_hi)],
+                    "pi_alpha": PI_ALPHA,
+                    "qhat": float(qhat),
+                }
         except Exception as e:  # pragma: no cover - optional path
             logging.warning("Quantile/CQR step skipped: %s", e)
 
@@ -2965,11 +5136,15 @@ def train_model(
 
     # Weighted metrics (include outlier down-weighting for fairness)
     def _wmae(y_true, y_pred, w_base, flags) -> float:
-        w = w_base * (np.where(flags, OUTLIER_WEIGHT_MULT, 1.0) if ENABLE_OUTLIER_SCORER else 1.0)
+        w = w_base * (
+            np.where(flags, OUTLIER_WEIGHT_MULT, 1.0) if ENABLE_OUTLIER_SCORER else 1.0
+        )
         return float(np.sum(w * np.abs(y_true - y_pred)) / np.sum(w))
 
     def _wrmse(y_true, y_pred, w_base, flags) -> float:
-        w = w_base * (np.where(flags, OUTLIER_WEIGHT_MULT, 1.0) if ENABLE_OUTLIER_SCORER else 1.0)
+        w = w_base * (
+            np.where(flags, OUTLIER_WEIGHT_MULT, 1.0) if ENABLE_OUTLIER_SCORER else 1.0
+        )
         return float(np.sqrt(np.sum(w * (y_true - y_pred) ** 2) / np.sum(w)))
 
     early_mae = mean_absolute_error(y_early, y_pred_early)
@@ -2991,11 +5166,22 @@ def train_model(
 
     # Robust MAPE (avoid zero-division)
     mape_mask = y_test > 0
-    mape = float(np.mean(np.abs((y_test[mape_mask] - y_pred_test[mape_mask]) / y_test[mape_mask])) * 100) if mape_mask.any() else float("nan")
+    mape = (
+        float(
+            np.mean(
+                np.abs((y_test[mape_mask] - y_pred_test[mape_mask]) / y_test[mape_mask])
+            )
+            * 100
+        )
+        if mape_mask.any()
+        else float("nan")
+    )
 
     def _nan_to_none(v):
         try:
-            return None if (v is None or (isinstance(v, float) and (np.isnan(v)))) else v
+            return (
+                None if (v is None or (isinstance(v, float) and (np.isnan(v)))) else v
+            )
         except Exception:
             return v
 
@@ -3003,6 +5189,15 @@ def train_model(
         "RMSE": rmse,
         "R2": r2_score(y_test, y_pred_test),
         "MAPE": _safe_mape(y_test, y_pred_test, w=w_test),
+        "MedAE": float(np.median(np.abs(y_test - y_pred_test))),
+        "SMAPE": float(
+            100.0
+            * np.mean(
+                2.0
+                * np.abs(y_test - y_pred_test)
+                / np.maximum(np.abs(y_test) + np.abs(y_pred_test), 1e-6)
+            )
+        ),
         "CV_WMAE": _nan_to_none(float(cv_metrics.get("CV_WMAE", float("nan")))),
         "CV_WRMSE": _nan_to_none(float(cv_metrics.get("CV_WRMSE", float("nan")))),
         "CV_MAE": _nan_to_none(float(cv_metrics.get("CV_MAE", float("nan")))),
@@ -3015,22 +5210,32 @@ def train_model(
         "TEST_WRMSE": test_wrmse,
         # Kaggle-style diagnostics
         "OOF_R2": _nan_to_none(oof_r2 if oof_r2 is not None else float("nan")),
-        "OOF_R2_LOG": _nan_to_none(oof_r2_log if oof_r2_log is not None else float("nan")),
+        "OOF_R2_LOG": _nan_to_none(
+            oof_r2_log if oof_r2_log is not None else float("nan")
+        ),
     }
 
     # Leak-safe post-fit blend: toward suburb medians, tuned on EARLY and applied on TEST
-    blend = {"lambda": 0.0, "pre_TEST_WMAE": metrics["TEST_WMAE"], "post_TEST_WMAE": metrics["TEST_WMAE"]}
+    blend = {
+        "lambda": 0.0,
+        "pre_TEST_WMAE": metrics["TEST_WMAE"],
+        "post_TEST_WMAE": metrics["TEST_WMAE"],
+    }
     try:
         if ENABLE_MEDIAN_BLEND:
             med_early = (
                 "SuburbBed365dMedian"
                 if "SuburbBed365dMedian" in early_df.columns
-                else ("Suburb90dMedian" if "Suburb90dMedian" in early_df.columns else None)
+                else (
+                    "Suburb90dMedian" if "Suburb90dMedian" in early_df.columns else None
+                )
             )
             med_test = (
                 "SuburbBed365dMedian"
                 if "SuburbBed365dMedian" in test_df.columns
-                else ("Suburb90dMedian" if "Suburb90dMedian" in test_df.columns else None)
+                else (
+                    "Suburb90dMedian" if "Suburb90dMedian" in test_df.columns else None
+                )
             )
             if med_early and med_test:
                 lambdas = np.linspace(0.0, MEDIAN_BLEND_LAMBDA_MAX, num=8)
@@ -3044,7 +5249,9 @@ def train_model(
                 if best_lam > 0:
                     med_t = pd.to_numeric(test_df[med_test], errors="coerce").to_numpy()
                     pt = (1 - best_lam) * y_pred_test + best_lam * med_t
-                    test_wmae_blend = float(np.sum(w_test * np.abs(y_test - pt)) / np.sum(w_test))
+                    test_wmae_blend = float(
+                        np.sum(w_test * np.abs(y_test - pt)) / np.sum(w_test)
+                    )
                     blend = {
                         "lambda": best_lam,
                         "pre_TEST_WMAE": metrics["TEST_WMAE"],
@@ -3059,33 +5266,65 @@ def train_model(
     adv_auc: float | None = None
     try:
         if ENABLE_ADVERSARIAL_VALID:
-            adv_auc, iw_tr, iw_ea = _adversarial_auc_and_weights(X_train, X_early, X_test)
+            adv_auc, iw_tr, iw_ea = _adversarial_auc_and_weights(
+                X_train, X_early, X_test
+            )
             if adv_auc > ADV_AUC_WARN:
-                logging.warning("Adversarial AUC=%.3f → notable TRAIN/EARLY→TEST shift", adv_auc)
+                logging.warning(
+                    "Adversarial AUC=%.3f → notable TRAIN/EARLY→TEST shift", adv_auc
+                )
                 # Apply importance weights to TRAIN (+EARLY if used in final fit)
                 try:
                     if len(w_train) == len(iw_tr):
-                        w_train = (w_train.astype(np.float32) * iw_tr).astype(np.float32)
+                        w_train = (w_train.astype(np.float32) * iw_tr).astype(
+                            np.float32
+                        )
                     if early_in_train and len(w_early) == len(iw_ea):
-                        w_early = (w_early.astype(np.float32) * iw_ea).astype(np.float32)
-                    logging.info("Applied covariate-shift importance weighting (clip=[%.2f, %.2f]).", ADV_WEIGHT_FLOOR, ADV_WEIGHT_CAP)
+                        w_early = (w_early.astype(np.float32) * iw_ea).astype(
+                            np.float32
+                        )
+                    logging.info(
+                        "Applied covariate-shift importance weighting (clip=[%.2f, %.2f]).",
+                        ADV_WEIGHT_FLOOR,
+                        ADV_WEIGHT_CAP,
+                    )
                 except Exception as _e:
                     logging.warning("Importance weighting skipped: %s", _e)
             if AUTO_DRIFT_SHRINK and adv_auc >= ADV_AUC_STRONG:
-                logging.warning("Drift strong (AUC=%.3f). Consider DRIFT_RECENT_YEARS or DATE_MIN to narrow TRAIN window.", adv_auc)
+                logging.warning(
+                    "Drift strong (AUC=%.3f). Consider DRIFT_RECENT_YEARS or DATE_MIN to narrow TRAIN window.",
+                    adv_auc,
+                )
     except Exception as e:  # pragma: no cover
         logging.warning("Adversarial validation skipped: %s", e)
-    cv_disp = metrics["CV_WMAE"] if isinstance(metrics["CV_WMAE"], (float, int)) else float("nan")
+    cv_disp = (
+        metrics["CV_WMAE"]
+        if isinstance(metrics["CV_WMAE"], (float, int))
+        else float("nan")
+    )
     if early_in_train:
         logging.info(
             "CV-%s %s | TEST-wMAE %.3f | raw-MAE %.0f | R² %.3f (EARLY used in final training; early metrics suppressed)",
-            opt_loss.upper(), (f"{cv_disp:.3f}" if np.isfinite(cv_disp) else "nan"), metrics["TEST_WMAE"], metrics["TEST_MAE"], metrics["R2"],
+            opt_loss.upper(),
+            (f"{cv_disp:.3f}" if np.isfinite(cv_disp) else "nan"),
+            metrics["TEST_WMAE"],
+            metrics["TEST_MAE"],
+            metrics["R2"],
         )
     else:
-        ew = metrics["EARLY_WMAE"] if isinstance(metrics["EARLY_WMAE"], (float, int)) else float("nan")
+        ew = (
+            metrics["EARLY_WMAE"]
+            if isinstance(metrics["EARLY_WMAE"], (float, int))
+            else float("nan")
+        )
         logging.info(
             "CV-%s %s | EARLY-wMAE %s | TEST-wMAE %.3f | raw-MAE %.0f | R² %.3f",
-            opt_loss.upper(), (f"{cv_disp:.3f}" if np.isfinite(cv_disp) else "nan"), (f"{ew:.3f}" if np.isfinite(ew) else "nan"), metrics["TEST_WMAE"], metrics["TEST_MAE"], metrics["R2"]
+            opt_loss.upper(),
+            (f"{cv_disp:.3f}" if np.isfinite(cv_disp) else "nan"),
+            (f"{ew:.3f}" if np.isfinite(ew) else "nan"),
+            metrics["TEST_WMAE"],
+            metrics["TEST_MAE"],
+            metrics["R2"],
         )
 
     # Step 5: drift guard (compare CV vs TEST on the same objective)
@@ -3101,10 +5340,16 @@ def train_model(
     except Exception:
         drift = float("nan")
     if np.isfinite(drift) and drift > DRIFT_TOL:
-        logging.warning("⚠️ %s drift %.1f%% exceeds tol %.0f%%", DRIFT_METRIC.upper(), drift * 100, DRIFT_TOL * 100)
+        logging.warning(
+            "⚠️ %s drift %.1f%% exceeds tol %.0f%%",
+            DRIFT_METRIC.upper(),
+            drift * 100,
+            DRIFT_TOL * 100,
+        )
         # Continue execution but highlight potential leakage; do not raise to allow diagnostics artifacts
 
     # Step 6: artifacts
+    ridge_final_path = None
     pipe_path = ARTIFACT_DIR / f"pipeline_{ds_hash}.joblib"
     meta_path = ARTIFACT_DIR / f"meta_{ds_hash}.json"
     imp_path = ARTIFACT_DIR / f"importance_{ds_hash}.csv"
@@ -3118,9 +5363,14 @@ def train_model(
         feat_names = list(num_cols) + list(cat_cols)
         importances_vec = base.get_feature_importance(type="FeatureImportance")
         if len(feat_names) != len(importances_vec):
-            feat_names = getattr(base, "feature_names_", None) or [f"f{i}" for i in range(len(importances_vec))]
-        importances = pd.DataFrame({"feature": feat_names, "gain": importances_vec}).sort_values("gain", ascending=False)
+            feat_names = getattr(base, "feature_names_", None) or [
+                f"f{i}" for i in range(len(importances_vec))
+            ]
+        importances = pd.DataFrame(
+            {"feature": feat_names, "gain": importances_vec}
+        ).sort_values("gain", ascending=False)
         importances.to_csv(imp_path, index=False)
+        _duplicate_artifact(imp_path)
     except Exception as e:
         logging.warning("Feature importance failed: %s", e)
         pd.DataFrame({"feature": [], "gain": []}).to_csv(imp_path, index=False)
@@ -3128,11 +5378,15 @@ def train_model(
     # Save exact model input matrices (features + target per split)
     try:
         feature_cols_final = list(dict.fromkeys(list(num_cols) + list(cat_cols)))
+
         def _export_split(df_split: pd.DataFrame, split_name: str) -> None:
             cols = [c for c in feature_cols_final if c in df_split.columns]
             export_df = df_split[cols + [target_col]].copy()
             export_df.insert(0, "__split", split_name)
-            export_df.to_csv(ARTIFACT_DIR / f"model_input_{split_name}_{ds_hash}.csv", index=False)
+            export_df.to_csv(
+                ARTIFACT_DIR / f"model_input_{split_name}_{ds_hash}.csv", index=False
+            )
+
         _export_split(train_df, "train")
         _export_split(early_df, "early")
         _export_split(test_df, "test")
@@ -3141,98 +5395,273 @@ def train_model(
 
     # Save split datasets for audit
     try:
-        train_df.assign(__split="train").to_csv(ARTIFACT_DIR / f"train_df_{ds_hash}.csv", index=False)
-        early_df.assign(__split="early").to_csv(ARTIFACT_DIR / f"early_df_{ds_hash}.csv", index=False)
-        test_df.assign(__split="test").to_csv(ARTIFACT_DIR / f"test_df_{ds_hash}.csv", index=False)
+        train_df.assign(__split="train").to_csv(
+            ARTIFACT_DIR / f"train_df_{ds_hash}.csv", index=False
+        )
+        early_df.assign(__split="early").to_csv(
+            ARTIFACT_DIR / f"early_df_{ds_hash}.csv", index=False
+        )
+        test_df.assign(__split="test").to_csv(
+            ARTIFACT_DIR / f"test_df_{ds_hash}.csv", index=False
+        )
     except Exception as e:
         logging.warning("Saving split datasets failed: %s", e)
 
     # Persist a unified sklearn Pipeline for serve-time (train=serve)
     try:
-        sk_pipeline = Pipeline([
-            ("preprocessor", preproc),
-            ("model", model),  # LogTargetWrapper exposes predict() in original scale
-        ])
+        sk_pipeline = Pipeline(
+            [
+                ("preprocessor", preproc),
+                (
+                    "model",
+                    model,
+                ),  # LogTargetWrapper exposes predict() in original scale
+            ]
+        )
         joblib.dump(sk_pipeline, pipe_path, compress=3)
+        _duplicate_artifact(pipe_path)
     except Exception:
         # Fallback to dict format; if that fails (e.g., unpicklable Dummy model in tests), skip persistence
         try:
-            joblib.dump({"preprocessor": preproc, "model": model, "cat_idx": cat_idx}, pipe_path, compress=3)
+            joblib.dump(
+                {"preprocessor": preproc, "model": model, "cat_idx": cat_idx},
+                pipe_path,
+                compress=3,
+            )
+            _duplicate_artifact(pipe_path)
         except Exception:
             logging.warning("Skipping pipeline persistence due to non-picklable model.")
+
+    # Persist per-seed CatBoost pipelines for serve-time averaging if ENSEMBLE_SIZE>1
+    seed_paths: list[str] = []
+    try:
+        if isinstance(models, list) and len(models) >= 1:
+            for i, m in enumerate(models, start=1):
+                try:
+                    seed_pipe = Pipeline(
+                        [
+                            ("preprocessor", preproc),
+                            ("model", m),
+                        ]
+                    )
+                    seed_path = (
+                        ARTIFACT_DIR / f"pipeline_CatBoost_seed{i}_{ds_hash}.joblib"
+                    )
+                    joblib.dump(seed_pipe, seed_path, compress=3)
+                    _duplicate_artifact(seed_path)
+                    seed_paths.append(str(seed_path))
+                    if LOG_CURVES:
+                        try:
+                            _curve_path = (
+                                ARTIFACT_DIR / f"curves_final_seed{i}_{ds_hash}.csv"
+                            )
+                            _save_cb_curve(
+                                m, _curve_path, label=f"final_seed{i}", sample_every=1
+                            )
+                        except Exception:
+                            pass
+                except Exception as _sp:
+                    logging.warning("Seed pipeline %d save skipped: %s", i, _sp)
+    except Exception:
+        pass
+
+    # Save final Ridge pipeline (optional) for serve-time blending
+    if TRAIN_RIDGE:
+        try:
+            # Use ENGINEERED data (train_df, early_df already have ALL features including rec2, Suburb medians)
+            if early_in_train:
+                ridge_fit_df = pd.concat(
+                    [train_df, early_df], axis=0, ignore_index=True
+                )
+                ridge_fit_y = np.concatenate([y_train, y_early])
+            else:
+                ridge_fit_df = train_df.copy()
+                ridge_fit_y = y_train.copy()
+
+            # Filter to Bed >= RIDGE_MIN_BED (Ridge trains on high-bedroom properties only)
+            if RIDGE_MIN_BED > 0 and "Bed" in ridge_fit_df.columns:
+                try:
+                    bed_series = pd.to_numeric(ridge_fit_df["Bed"], errors="coerce")
+                    mask = (bed_series >= RIDGE_MIN_BED).fillna(False).to_numpy()
+                    if mask.sum() >= 50:
+                        ridge_fit_df = ridge_fit_df[mask]
+                        ridge_fit_y = ridge_fit_y[mask]
+                        logging.info(
+                            "Ridge final: training on engineered data with Bed >= %d (rows=%d)",
+                            RIDGE_MIN_BED,
+                            int(mask.sum()),
+                        )
+                    else:
+                        logging.info(
+                            "Ridge final: insufficient rows for Bed >= %d (got %d); using all rows",
+                            RIDGE_MIN_BED,
+                            int(mask.sum()),
+                        )
+                        # Don't filter if too few rows
+                except Exception as e:
+                    logging.warning("Ridge Bed filtering failed: %s", e)
+
+            # Build DF-in Ridge pipeline embedding the SAME preprocessor as CatBoost
+            X_train_arr = np.asarray(X_train)
+            cat_idx_final = _clip_cat_indices(list(cat_idx), int(X_train_arr.shape[1]))
+            cat_cols_for_encoding = [
+                i for i in cat_idx_final if i < int(X_train_arr.shape[1])
+            ]
+            ridge_pipeline_with_preproc = _build_ridge_with_preproc(
+                preproc=preproc,
+            )
+
+            ridge_pipeline_with_preproc.fit(
+                ridge_fit_df[num_cols + cat_cols], ridge_fit_y
+            )
+
+            # Smoke test: verify Ridge can predict before persisting (on a tiny slice)
+            ridge_smoke_ok = False
+            try:
+                test_rows = max(1, min(5, ridge_fit_df.shape[0]))
+                _ = ridge_pipeline_with_preproc.predict(
+                    ridge_fit_df[num_cols + cat_cols].iloc[:test_rows]
+                )
+                ridge_smoke_ok = True
+            except Exception as _sm_err:
+                logging.warning("Ridge smoke test failed: %s", _sm_err)
+
+            # Only save Ridge if smoke test passes
+            ridge_final_path = None
+            if ridge_smoke_ok:
+                ridge_final_path = ARTIFACT_DIR / f"pipeline_Ridge_{ds_hash}.joblib"
+                # Save Ridge pipeline (expects DataFrame; preprocessor embedded)
+                joblib.dump(ridge_pipeline_with_preproc, ridge_final_path, compress=3)
+                _duplicate_artifact(ridge_final_path)
+                logging.info("Saved Ridge pipeline  %s", ridge_final_path)
+            else:
+                logging.warning("Ridge artifact not saved due to failed smoke test")
+        except Exception as e:
+            logging.warning("Ridge final pipeline skipped: %s", e)
+            ridge_final_path = None
 
     # Build and save serve-time bundle: rolling medians (TRAIN-only, shifted), LOO encoders (if available), ranker meta
     try:
         # Rolling 90D median per suburb time series (TRAIN rows only, shift to avoid same-day leakage)
         med_src = (
             train_df[[suburb_col, date_col, target_col]]
-            .rename(columns={target_col: "Last Rental Price", date_col: "Date", suburb_col: "Suburb"})
+            .rename(
+                columns={
+                    target_col: "Last Rental Price",
+                    date_col: "Date",
+                    suburb_col: "Suburb",
+                }
+            )
             .dropna(subset=["Last Rental Price"])  # safety
         )
         med_src["Date"] = pd.to_datetime(med_src["Date"], errors="coerce")
-        med_src = med_src.sort_values(["Suburb", "Date"])  
+        med_src = med_src.sort_values(["Suburb", "Date"])
+
         def _roll_g(g: pd.DataFrame) -> pd.DataFrame:
             s = g.set_index("Date")["Last Rental Price"]
             s_med = _roll_median(s, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_MED_MIN_COUNT)
-            out = s_med.reset_index().rename(columns={"Last Rental Price": "Suburb90dMedian"})
+            out = s_med.reset_index().rename(
+                columns={"Last Rental Price": "Suburb90dMedian"}
+            )
             out["Suburb"] = g["Suburb"].iloc[0]
             return out
-        med_all = med_src.groupby("Suburb", dropna=False, group_keys=False).apply(_roll_g)
+
+        med_all = med_src.groupby("Suburb", dropna=False, group_keys=False).apply(
+            _roll_g
+        )
         med_all = med_all[["Suburb", "Date", "Suburb90dMedian"]]
         med_all.to_csv(med90_path, index=False)
+        _duplicate_artifact(med90_path)
         # 90D median per suburb+bed (TRAIN-only)
         if "Bed" in train_df.columns:
             med_bed_src = (
                 train_df[[suburb_col, "Bed", date_col, target_col]]
-                .rename(columns={target_col: "Last Rental Price", date_col: "Date", suburb_col: "Suburb"})
+                .rename(
+                    columns={
+                        target_col: "Last Rental Price",
+                        date_col: "Date",
+                        suburb_col: "Suburb",
+                    }
+                )
                 .dropna(subset=["Last Rental Price"])  # safety
             )
             med_bed_src["Date"] = pd.to_datetime(med_bed_src["Date"], errors="coerce")
             med_bed_src["Bed"] = med_bed_src["Bed"].astype("string")
-            med_bed_src = med_bed_src.sort_values(["Suburb", "Bed", "Date"])  
+            med_bed_src = med_bed_src.sort_values(["Suburb", "Bed", "Date"])
+
             def _roll_gb(g: pd.DataFrame) -> pd.DataFrame:
                 s = g.set_index("Date")["Last Rental Price"]
-                s_med = _roll_median(s, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_BED_MIN_COUNT)
-                out = s_med.reset_index().rename(columns={"Last Rental Price": "SuburbBed90dMedian"})
+                s_med = _roll_median(
+                    s, f"{SUBURB_MED_WINDOW_DAYS}D", SUBURB_BED_MIN_COUNT
+                )
+                out = s_med.reset_index().rename(
+                    columns={"Last Rental Price": "SuburbBed90dMedian"}
+                )
                 out["Suburb"] = g["Suburb"].iloc[0]
                 out["Bed"] = g["Bed"].iloc[0]
                 return out
-            med_bed_all = med_bed_src.groupby(["Suburb", "Bed"], dropna=False, group_keys=False).apply(_roll_gb)
-            med_bed_all = med_bed_all.drop_duplicates(subset=["Suburb", "Bed", "Date"], keep="last")
+
+            med_bed_all = med_bed_src.groupby(
+                ["Suburb", "Bed"], dropna=False, group_keys=False
+            ).apply(_roll_gb)
+            med_bed_all = med_bed_all.drop_duplicates(
+                subset=["Suburb", "Bed", "Date"], keep="last"
+            )
             med90_bed_path = ARTIFACT_DIR / f"med90_bed_{ds_hash}.csv"
             med_bed_all = med_bed_all[["Suburb", "Bed", "Date", "SuburbBed90dMedian"]]
             med_bed_all.to_csv(med90_bed_path, index=False)
+            _duplicate_artifact(med90_bed_path)
         else:
             med90_bed_path = None
 
         # 365D medians (TRAIN-only) when flag is enabled
         if USE_SUBURB_MEDIANS and USE_SUBURB_365D_MEDIAN:
             med365_src = med_src.copy()
+
             def _roll_g365(g: pd.DataFrame) -> pd.DataFrame:
                 s = g.set_index("Date")["Last Rental Price"]
                 s_med = _roll_median(s, "365D", SUBURB_MED365_MIN_COUNT)
-                out = s_med.reset_index().rename(columns={"Last Rental Price": "Suburb365dMedian"})
+                out = s_med.reset_index().rename(
+                    columns={"Last Rental Price": "Suburb365dMedian"}
+                )
                 out["Suburb"] = g["Suburb"].iloc[0]
                 return out
-            med365_all = med365_src.groupby("Suburb", dropna=False, group_keys=False).apply(_roll_g365)
-            med365_all = med365_all.drop_duplicates(subset=["Suburb", "Date"], keep="last")
+
+            med365_all = med365_src.groupby(
+                "Suburb", dropna=False, group_keys=False
+            ).apply(_roll_g365)
+            med365_all = med365_all.drop_duplicates(
+                subset=["Suburb", "Date"], keep="last"
+            )
             med365_path = ARTIFACT_DIR / f"med365_{ds_hash}.csv"
             med365_all = med365_all[["Suburb", "Date", "Suburb365dMedian"]]
             med365_all.to_csv(med365_path, index=False)
+            _duplicate_artifact(med365_path)
             if "Bed" in train_df.columns:
                 med365_bed_src = med_bed_src.copy()
+
                 def _roll_gb365(g: pd.DataFrame) -> pd.DataFrame:
                     s = g.set_index("Date")["Last Rental Price"]
                     s_med = _roll_median(s, "365D", SUBURB_MED365_MIN_COUNT)
-                    out = s_med.reset_index().rename(columns={"Last Rental Price": "SuburbBed365dMedian"})
+                    out = s_med.reset_index().rename(
+                        columns={"Last Rental Price": "SuburbBed365dMedian"}
+                    )
                     out["Suburb"] = g["Suburb"].iloc[0]
                     out["Bed"] = g["Bed"].iloc[0]
                     return out
-                med365_bed_all = med365_bed_src.groupby(["Suburb", "Bed"], dropna=False, group_keys=False).apply(_roll_gb365)
-                med365_bed_all = med365_bed_all.drop_duplicates(subset=["Suburb", "Bed", "Date"], keep="last")
+
+                med365_bed_all = med365_bed_src.groupby(
+                    ["Suburb", "Bed"], dropna=False, group_keys=False
+                ).apply(_roll_gb365)
+                med365_bed_all = med365_bed_all.drop_duplicates(
+                    subset=["Suburb", "Bed", "Date"], keep="last"
+                )
                 med365_bed_path = ARTIFACT_DIR / f"med365_bed_{ds_hash}.csv"
-                med365_bed_all = med365_bed_all[["Suburb", "Bed", "Date", "SuburbBed365dMedian"]]
+                med365_bed_all = med365_bed_all[
+                    ["Suburb", "Bed", "Date", "SuburbBed365dMedian"]
+                ]
                 med365_bed_all.to_csv(med365_bed_path, index=False)
+                _duplicate_artifact(med365_bed_path)
             else:
                 med365_bed_path = None
         else:
@@ -3248,17 +5677,29 @@ def train_model(
     enc_saved = False
     try:
         if SuburbLOOEncoder is not None:
-            enc_sub = SuburbLOOEncoder(col=suburb_col, sigma=0.1, random_state=RANDOM_STATE)
+            # Prefer native smoothing parameter 'k' for forward-compatibility
+            enc_sub = SuburbLOOEncoder(
+                col=suburb_col, k=0.1 if isinstance(0.1, float) else 10.0
+            )
             enc_sub.fit(train_df[[suburb_col]], train_df[target_col])
         else:
             enc_sub = None
         if SuburbMonthLOOEncoder is not None:
-            enc_sm = SuburbMonthLOOEncoder(suburb_col=suburb_col, date_col=date_col, sigma=0.1, random_state=RANDOM_STATE)
+            enc_sm = SuburbMonthLOOEncoder(
+                suburb_col=suburb_col,
+                date_col=date_col,
+                k=0.1 if isinstance(0.1, float) else 10.0,
+            )
             enc_sm.fit(train_df[[suburb_col, date_col]], train_df[target_col])
         else:
             enc_sm = None
         if enc_sub is not None or enc_sm is not None:
-            joblib.dump({"suburb_loo": enc_sub, "suburb_month_loo": enc_sm}, enc_path, compress=3)
+            joblib.dump(
+                {"suburb_loo": enc_sub, "suburb_month_loo": enc_sm},
+                enc_path,
+                compress=3,
+            )
+            _duplicate_artifact(enc_path)
             enc_saved = True
     except Exception as e:
         logging.warning("Serve bundle encoders failed: %s", e)
@@ -3267,7 +5708,15 @@ def train_model(
     # Persist ranker meta (stateless) for discovery
     try:
         with open(rank_path, "w") as rp:
-            json.dump({"type": "MonthlyRankingTransformer", "date_col": str(date_col), "price_col": str(target_col)}, rp)
+            json.dump(
+                {
+                    "type": "MonthlyRankingTransformer",
+                    "date_col": str(date_col),
+                    "price_col": str(target_col),
+                },
+                rp,
+            )
+        _duplicate_artifact(rank_path)
     except Exception as e:
         logging.warning("Ranker meta save failed: %s", e)
         rank_path = None
@@ -3275,54 +5724,348 @@ def train_model(
     # Optional SHAP (grouped)
     if explain:
         try:
-            import shap  # type: ignore
-            expl = shap.TreeExplainer(base)
+            from plotting import save_shap_summary_catboost
+
             X_test_d = np.array(X_test, copy=False)
-            shap_vals = expl.shap_values(X_test_d)
-            base_map = [*num_cols, *cat_cols]
-            # crude grouping by base column
-            grouped = {}
-            for i, b in enumerate(base_map):
-                grouped.setdefault(b, []).append(shap_vals[:, i])
-            import numpy as _np
-            grouped_vals = _np.column_stack([_np.abs(_np.column_stack(v)).mean(axis=1) for v in grouped.values()])
-            import matplotlib.pyplot as plt
-            shap.summary_plot(grouped_vals, feature_names=list(grouped.keys()), show=False)
-            plt.tight_layout(); plt.savefig(shap_path, dpi=150); plt.close()
+            shap_art, shap_plot = save_shap_summary_catboost(
+                base,
+                X_test_d,
+                [*num_cols, *cat_cols],
+                str(PLOTS_DIR),
+                ds_hash,
+                artifact_path=str(PLOTS_DIR / f"shap_{ds_hash}.png"),
+            )
+            shap_path = shap_art
         except Exception as e:
             logging.warning("SHAP failed: %s", e)
             shap_path = None
 
+    # Plot Actual vs Predicted (TEST) to plots directory
+    try:
+        from plotting import (
+            plot_actual_vs_predicted,
+            plot_actual_vs_predicted_dual,
+            plot_residual_scatter,
+            save_error_tables,
+        )
+
+        plot_actual_vs_predicted(
+            y_test,
+            y_pred_test,
+            str(PLOTS_DIR),
+            filename=f"actual_vs_predicted_{ds_hash}.png",
+        )
+        plot_actual_vs_predicted_dual(
+            y_test,
+            y_pred_test,
+            str(PLOTS_DIR),
+            filename=f"actual_vs_predicted_dual_{ds_hash}.png",
+        )
+        plot_residual_scatter(
+            y_test,
+            y_pred_test,
+            test_df,
+            str(PLOTS_DIR),
+            filename=f"residual_scatter_{ds_hash}.png",
+        )
+        try:
+            _paths = save_error_tables(
+                test_df, y_test, y_pred_test, str(PLOTS_DIR), ds_hash
+            )
+            if _paths:
+                logging.info(
+                    "Error analysis saved: %s",
+                    ", ".join([f"{k}=>{v}" for k, v in _paths.items()]),
+                )
+        except Exception as _pe:
+            logging.debug("Error tables skipped: %s", _pe)
+    except Exception as _plot_err:
+        logging.warning("Skipping Actual vs Predicted plots: %s", _plot_err)
+
+    # Export removed rows audit if collected
+    try:
+        if isinstance(removed_tracker, _RemovedRowsCollector):
+            audit_path = PLOTS_DIR / f"removed_outliers_{ds_hash}.csv"
+            removed_tracker.export_csv(audit_path)
+    except Exception:
+        pass
+
+    # Snapshot environment and run command (best-effort)
+    pip_freeze_txt = None
+    run_cmd_txt = None
+    try:
+        import subprocess, sys as _sys
+
+        _pf = subprocess.run(
+            [_sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True
+        )
+        if _pf and _pf.stdout:
+            _pip_path = ARTIFACT_DIR / f"pip_{ds_hash}.txt"
+            with open(_pip_path, "w", encoding="utf-8") as _pfh:
+                _pfh.write(_pf.stdout)
+            pip_freeze_txt = str(_pip_path)
+    except Exception:
+        pip_freeze_txt = None
+    try:
+        _run_path = ARTIFACT_DIR / f"run_{ds_hash}.txt"
+        _argv = " ".join(sys.argv) if hasattr(sys, "argv") else "python main.py"
+        with open(_run_path, "w", encoding="utf-8") as _rfh:
+            _rfh.write(_argv)
+        run_cmd_txt = str(_run_path)
+    except Exception:
+        run_cmd_txt = None
+
+    # CV summary for metadata
+    cv_summary = None
+    try:
+        if cv_fold_rows:
+            _vals = [
+                float(r.get("WMAE", np.nan))
+                for r in cv_fold_rows
+                if np.isfinite(r.get("WMAE", np.nan))
+            ]
+            if _vals:
+                cv_summary = {
+                    "mode": (
+                        "ames_kfold" if CV_MODE == "ames_kfold" else "walk_forward"
+                    ),
+                    "n_splits": int(len(cv_fold_rows)),
+                    "wmae_mean": float(np.mean(_vals)),
+                    "wmae_std": float(np.std(_vals)),
+                }
+    except Exception:
+        cv_summary = None
+
+    # Align blend_head with availability of Ridge artifact
+    try:
+        if (
+            ridge_final_path is None
+            and isinstance(blend_head, dict)
+            and "labels" in blend_head
+        ):
+            _labs = list(blend_head.get("labels", []))
+            _wts = list(blend_head.get("weights", []))
+            if "Ridge" in _labs:
+                _idx = _labs.index("Ridge")
+                _labs.pop(_idx)
+                if _idx < len(_wts):
+                    _wts.pop(_idx)
+                if not _labs:  # fallback to CatBoost only
+                    _labs, _wts = ["CatBoost"], [1.0]
+            blend_head["labels"] = _labs
+            blend_head["weights"] = _wts
+    except Exception:
+        pass
+
+    # Persist ridge_signature for serve adapter
+    _ridge_signature = None
+    try:
+        if ridge_final_path:
+            _ridge_signature = {
+                "expects_dataframe": True,
+                "expects_named_columns": True,
+                "feature_order": list(num_cols) + list(cat_cols),
+                "n_in": int(len(list(num_cols) + list(cat_cols))),
+            }
+    except Exception:
+        pass
+
+    # Optionally gate serve-time blending if it does not improve EARLY
+    APPLY_BLEND_AT_SERVE_FINAL = bool(BLEND_AT_SERVE)
+    try:
+        if (
+            APPLY_BLEND_AT_SERVE_FINAL
+            and blend_head
+            and early_df is not None
+            and len(early_df) > 0
+        ):
+            # CatBoost-only EARLY predictions
+            X_early = np.array(
+                preproc.transform(early_df[num_cols + cat_cols]), copy=False
+            )
+            cb_early = _safe_expm1(model.predict(X_early))
+            # Ridge EARLY predictions if artifact exists in memory
+            rc_early = None
+            try:
+                if TRAIN_RIDGE and "ridge_pipeline_with_preproc" in locals():
+                    rc_early = ridge_pipeline_with_preproc.predict(
+                        early_df[num_cols + cat_cols]
+                    )
+            except Exception:
+                rc_early = None
+            # Build blended EARLY with same row-wise gating as serve (Bed >= RIDGE_MIN_BED)
+            if (
+                rc_early is not None
+                and "weights" in blend_head
+                and "labels" in blend_head
+            ):
+                # Build blend only over intersection of learned labels and available predictions
+                learned_labels = list(blend_head.get("labels", []))
+                learned_weights = np.asarray(
+                    blend_head.get("weights", []), float
+                ).reshape(-1)
+                pred_map = {"CatBoost": cb_early.reshape(-1)}
+                if rc_early is not None:
+                    pred_map["Ridge"] = rc_early.reshape(-1)
+                chosen = [
+                    (lab, pred_map[lab]) for lab in learned_labels if lab in pred_map
+                ]
+                if not chosen:
+                    base = cb_early.reshape(-1)
+                else:
+                    P = np.vstack([arr for _, arr in chosen]).T
+                    # Build weights aligned to chosen labels
+                    w = np.asarray(
+                        [
+                            learned_weights[learned_labels.index(lab)]
+                            for lab, _ in chosen
+                        ],
+                        float,
+                    )
+                    if w.size != P.shape[1] or not np.isfinite(w).all() or w.sum() <= 0:
+                        w = np.ones(P.shape[1], dtype=float) / float(P.shape[1])
+                    base = (P @ (w / w.sum())).reshape(-1)
+                # Apply Bed gating (Ridge contributes only where mask true)
+                if (
+                    ("Ridge" in pred_map)
+                    and ("CatBoost" in pred_map)
+                    and ("Bed" in early_df.columns)
+                    and (RIDGE_MIN_BED > 0)
+                ):
+                    try:
+                        ridge_idx = [lab for lab, _ in chosen].index("Ridge")
+                        cb_idx = [lab for lab, _ in chosen].index("CatBoost")
+                    except ValueError:
+                        ridge_idx = cb_idx = -1
+                    bed_vals = pd.to_numeric(
+                        early_df["Bed"], errors="coerce"
+                    ).to_numpy()
+                    mask = np.isfinite(bed_vals) & (bed_vals >= RIDGE_MIN_BED)
+                    try:
+                        if ridge_idx >= 0 and cb_idx >= 0:
+                            wnorm = w / w.sum()
+                            delta = wnorm[ridge_idx] * (P[:, ridge_idx] - P[:, cb_idx])
+                            base = base - (~mask).astype(float) * delta
+                    except Exception:
+                        pass
+                y_ea = early_df[target_col].to_numpy()
+                # Weighted MAE for CatBoost-only vs blended
+                cap_ea = np.percentile(y_ea, 99.5)
+                cap_ea = (
+                    cap_ea
+                    if np.isfinite(cap_ea) and cap_ea > 0
+                    else (
+                        float(np.nanmax(y_ea)) if np.isfinite(np.nanmax(y_ea)) else 1.0
+                    )
+                )
+                w_ea = make_weights(y_ea, cap_ea)
+                wmae_cb = float(np.sum(w_ea * np.abs(y_ea - cb_early)) / np.sum(w_ea))
+                wmae_blend = float(np.sum(w_ea * np.abs(y_ea - base)) / np.sum(w_ea))
+                if not (wmae_blend < wmae_cb):
+                    APPLY_BLEND_AT_SERVE_FINAL = False
+                    logging.info(
+                        "Blend gating: EARLY WMAE did not improve (cb=%.3f, blend=%.3f) -> disabling serve-time blend",
+                        wmae_cb,
+                        wmae_blend,
+                    )
+    except Exception as _eg:
+        logging.warning("Blend EARLY gating skipped: %s", _eg)
+
     with open(meta_path, "w") as fp:
         json.dump(
             {
+                "schema_version": "3.2",
                 "metrics": metrics,
                 "best_params": best_params,
                 "quantile_pipelines": q_paths if q_paths else None,
                 "conformal": cqr,
                 "adversarial_auc": adv_auc,
                 "adv_auc_warn": ADV_AUC_WARN,
+                "tail_weighting": {
+                    "threshold": float(TAIL_THRESH),
+                    "multiplier": float(TAIL_MULT),
+                },
                 "blend": blend,
+                "blend_head": blend_head,
+                "apply_blend_at_serve": bool(APPLY_BLEND_AT_SERVE_FINAL),
                 "domain_importance": domain_importance,
                 "num_features": list(num_cols),
                 "cat_features": list(cat_cols),
-                "rows": {"train": int(len(train_df)), "early": int(len(early_df)), "test": int(len(test_df))},
+                "feature_order": list(num_cols) + list(cat_cols),
+                "cat_idx_final": list(
+                    _clip_cat_indices(
+                        list(cat_idx_final),
+                        int(
+                            np.asarray(
+                                preproc.transform(
+                                    train_df[num_cols + cat_cols].iloc[:1]
+                                )
+                            ).shape[1]
+                        ),
+                    )
+                ),
+                "rows": {
+                    "train": int(len(train_df)),
+                    "early": int(len(early_df)),
+                    "test": int(len(test_df)),
+                },
                 "importance_csv": str(imp_path),
+                "folds_csv": (folds_csv_path or None),
                 "pipeline": str(pipe_path),
                 "shap_png": str(shap_path) if shap_path else None,
+                "log_policy": {
+                    "keep_raw_when_log": bool(
+                        os.getenv("KEEP_RAW_WHEN_LOG", "0").lower()
+                        in {"1", "true", "yes"}
+                    )
+                },
                 "serve_bundle": {
                     "med90_csv": (str(med90_path) if med90_path else None),
-                    "med90_bed_csv": (str(med90_bed_path) if ("med90_bed_path" in locals() and med90_bed_path) else None),
-                    "med365_csv": (str(med365_path) if ("med365_path" in locals() and med365_path) else None),
-                    "med365_bed_csv": (str(med365_bed_path) if ("med365_bed_path" in locals() and med365_bed_path) else None),
+                    "med90_bed_csv": (
+                        str(med90_bed_path)
+                        if ("med90_bed_path" in locals() and med90_bed_path)
+                        else None
+                    ),
+                    "med365_csv": (
+                        str(med365_path)
+                        if ("med365_path" in locals() and med365_path)
+                        else None
+                    ),
+                    "med365_bed_csv": (
+                        str(med365_bed_path)
+                        if ("med365_bed_path" in locals() and med365_bed_path)
+                        else None
+                    ),
                     "encoders_joblib": (str(enc_path) if enc_saved else None),
                     "ranker_meta": (str(rank_path) if rank_path else None),
+                    # NEW: expose FE cap + base pipelines for serve-time blending
+                    "fe_max_levels": int(getattr(preproc, "max_levels", 15)),
+                    "base_pipelines": {
+                        "CatBoost": str(pipe_path),
+                        **(
+                            {"Ridge": str(ridge_final_path)} if ridge_final_path else {}
+                        ),
+                    },
+                    "ridge_signature": _ridge_signature,
+                    "catboost_seed_pipelines": (seed_paths if seed_paths else None),
+                },
+                "training_env": {
+                    "python": platform.python_version(),
+                    "numpy": np.__version__,
+                    "pandas": pd.__version__,
+                    "sklearn": __import__("sklearn").__version__,
+                    "scipy": __import__("scipy").__version__,
+                    "catboost": __import__("catboost").__version__,
+                    "shap": __import__("shap").__version__,
+                    "joblib": __import__("joblib").__version__,
                 },
                 "flags": {
                     "enable_outlier_scorer": ENABLE_OUTLIER_SCORER,
                     "outlier_weight_mult": OUTLIER_WEIGHT_MULT,
                     "drop_train_outliers": OUTLIER_DROP_TRAIN,
+                    "ridge_min_bed": int(RIDGE_MIN_BED),
                 },
+                "cv": cv_summary,
                 "geo": (
                     {
                         "poi_csv": geo_env_cfg["poi_csv"],
@@ -3331,14 +6074,20 @@ def train_model(
                         "radii_km": list(geo_env_cfg["radii_km"]),
                         "decay_km": geo_env_cfg["decay_km"],
                         "max_decay_km": geo_env_cfg["max_decay_km"],
-                        "categories": list(geo_env_cfg["categories"]) if geo_env_cfg["categories"] else None,
+                        "categories": list(geo_env_cfg["categories"])
+                        if geo_env_cfg["categories"]
+                        else None,
                     }
-                ) if geo_env_cfg else None,
+                )
+                if geo_env_cfg
+                else None,
                 "teacher_pipeline": TEACHER_PIPELINE if TEACHER_PIPELINE else None,
+                "env_snapshot": {"pip_freeze": pip_freeze_txt, "run_cmd": run_cmd_txt},
             },
             fp,
             indent=2,
         )
+    _duplicate_artifact(meta_path)
     logging.info("Artefacts saved → %s", pipe_path)
     try:
         with open(meta_path, "r") as _mf:
@@ -3350,31 +6099,68 @@ def train_model(
             meta_obj["MAE"] = meta_obj["metrics"].get("TEST_MAE")
     except Exception:
         pass
-    return {"pipeline": str(pipe_path), "metadata": meta_obj, "importance": str(imp_path), "shap": shap_path, "model": model}
+
+    # Export full cleaned dataset snapshot (after training completes)
+    try:
+        from plotting import save_cleaned_full_dataset
+
+        save_cleaned_full_dataset(df_time, str(PLOTS_DIR), ds_hash)
+    except Exception:
+        pass
+
+    # Deprecated: standalone prediction service sync removed
+    # Rationale: keep a single source of truth for serving (root prediction.py + artifacts/)
+    # This avoids loader/schema drift and inflated predictions due to code duplication.
+
+    return {
+        "pipeline": str(pipe_path),
+        "metadata": meta_obj,
+        "importance": str(imp_path),
+        "shap": shap_path,
+        "model": model,
+    }
 
 
 # ──────────────────────────────── CLI ──────────────────────────────── #
 
+
 def cli() -> None:
     p = argparse.ArgumentParser(description="Train CatBoost rental model • v7.2")
     p.add_argument("csv_path")
-    p.add_argument("--target", default="Rent")
-    p.add_argument("--date", default="Date")
+    p.add_argument("--target", default="Last Rental Price")
+    p.add_argument("--date", default="Last Rental Date")
     p.add_argument("--suburb", default="Suburb")
     p.add_argument("--gpu", action="store_true")
     p.add_argument("--no-scale", action="store_true")
-    p.add_argument("--no-block-cv", action="store_true", help="Disable monthly block CV (fallback to TimeSeriesSplit)")
-    p.add_argument("--skip-featurealgo", action="store_true", help="(kept for API compat)")
+    p.add_argument(
+        "--no-block-cv",
+        action="store_true",
+        help="Disable monthly block CV (fallback to TimeSeriesSplit)",
+    )
+    p.add_argument(
+        "--skip-featurealgo", action="store_true", help="(kept for API compat)"
+    )
     p.add_argument("--train-frac", type=float, default=0.70)
     p.add_argument("--valid-frac", type=float, default=0.15)
     p.add_argument("--max-ohe-card", type=int, default=15)  # kept for API compat
     p.add_argument("--explain", action="store_true")
     p.add_argument("--log-level", default="INFO")
-    p.add_argument("--walk-cv", action="store_true", help="Use walk-forward CV instead of Monte-Carlo")
+    p.add_argument(
+        "--walk-cv",
+        action="store_true",
+        help="Use walk-forward CV instead of Monte-Carlo",
+    )
     p.add_argument("--gap-months", type=int, default=0)
-    p.add_argument("--gap-days", type=int, default=0, help="Absolute embargo in days between TRAIN and VAL")
+    p.add_argument(
+        "--gap-days",
+        type=int,
+        default=0,
+        help="Absolute embargo in days between TRAIN and VAL",
+    )
     p.add_argument("--dedup-by-address", action="store_true")
-    p.add_argument("--trials", type=int, help="Override Optuna trials (default from env or 200)")
+    p.add_argument(
+        "--trials", type=int, help="Override Optuna trials (default from env or 200)"
+    )
     p.add_argument("--timeout-sec", type=int, help="Optuna timeout (0=unlimited)")
     args = p.parse_args()
 
@@ -3414,4 +6200,3 @@ def cli() -> None:
 
 if __name__ == "__main__":
     cli()
-

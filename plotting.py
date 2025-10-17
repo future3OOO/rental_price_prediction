@@ -173,7 +173,7 @@ def plot_residuals(y_true, y_pred, plot_dir):
         logging.error(traceback.format_exc())
 
 
-def plot_actual_vs_predicted(y_true, y_pred, plot_dir):
+def plot_actual_vs_predicted(y_true, y_pred, plot_dir, filename: str | None = None):
     """
     Scatter of Actual vs Predicted with a reference line + metrics.
     """
@@ -205,13 +205,506 @@ def plot_actual_vs_predicted(y_true, y_pred, plot_dir):
 
         plt.tight_layout()
         os.makedirs(plot_dir, exist_ok=True)
-        fpath = os.path.join(plot_dir, 'actual_vs_predicted.png')
+        out_name = filename if filename else 'actual_vs_predicted.png'
+        fpath = os.path.join(plot_dir, out_name)
         plt.savefig(fpath)
+        # Also write canonical stable name for dashboards/tools
+        try:
+            canonical = os.path.join(plot_dir, 'actual_vs_predicted.png')
+            if os.path.abspath(fpath) != os.path.abspath(canonical):
+                import shutil as _sh
+                _sh.copyfile(fpath, canonical)
+        except Exception:
+            pass
         plt.close(fig)
         logging.info(f"Actual vs Predicted plot saved => {fpath}")
     except Exception as e:
         logging.error(f"Error in plot_actual_vs_predicted: {str(e)}")
         logging.error(traceback.format_exc())
+
+
+def plot_actual_vs_predicted_dual(y_true, y_pred, plot_dir: str, filename: str | None = None):
+    """Overlay Real (blue) vs Predict (red) points for the same index.
+
+    - Adds y=x reference line
+    - Uses light alpha to reveal density
+    """
+    try:
+        y_true = np.asarray(y_true, dtype=float).reshape(-1)
+        y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+        n = min(len(y_true), len(y_pred))
+        plt.figure(figsize=(8, 5))
+        plt.scatter(range(n), y_true[:n], color='tab:blue', alpha=0.6, s=18, label='Real')
+        plt.scatter(range(n), y_pred[:n], color='tab:red', alpha=0.6, s=18, label='Predict')
+        plt.title('Real vs Predict (overlay)')
+        plt.xlabel('Row index (TEST order)')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.tight_layout()
+        os.makedirs(plot_dir, exist_ok=True)
+        fname = filename if filename else 'actual_vs_predicted_dual.png'
+        outp = os.path.join(plot_dir, fname)
+        plt.savefig(outp, dpi=150)
+        # Also write canonical stable name
+        try:
+            canonical = os.path.join(plot_dir, 'actual_vs_predicted_dual.png')
+            if os.path.abspath(outp) != os.path.abspath(canonical):
+                import shutil as _sh
+                _sh.copyfile(outp, canonical)
+        except Exception:
+            pass
+        plt.close()
+    except Exception as e:
+        logging.warning(f"dual Real/Predict plot failed: {e}")
+
+
+def plot_residual_scatter(y_true, y_pred, df: pd.DataFrame | None, plot_dir: str, filename: str):
+    """Scatter of Actual vs Pred with points colored by abs% error and sized by error.
+
+    If df provided and contains 'Bed', annotate colorbar title accordingly.
+    """
+    try:
+        yt = np.asarray(y_true, float).reshape(-1)
+        yp = np.asarray(y_pred, float).reshape(-1)
+        n = min(len(yt), len(yp))
+        yt, yp = yt[:n], yp[:n]
+        ape = np.zeros(n)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mask = yt > 0
+            ape[mask] = np.abs(yp[mask] - yt[mask]) / yt[mask]
+        sz = (np.clip(ape, 0, 1.5) * 60 + 8)
+        plt.figure(figsize=(8, 6))
+        sc = plt.scatter(yt, yp, c=ape, s=sz, cmap='viridis', alpha=0.65, edgecolors='none')
+        lim = [min(yt.min(), yp.min()), max(yt.max(), yp.max())]
+        plt.plot(lim, lim, 'k--', linewidth=1, alpha=0.6)
+        plt.xlabel('Actual')
+        plt.ylabel('Predicted')
+        plt.title('Actual vs Predicted (colored by |APE|)')
+        cbar = plt.colorbar(sc)
+        cbar.set_label('|APE|')
+        plt.tight_layout()
+        os.makedirs(plot_dir, exist_ok=True)
+        outp = os.path.join(plot_dir, filename)
+        plt.savefig(outp, dpi=150)
+        # Also write canonical stable name
+        try:
+            canonical = os.path.join(plot_dir, 'residual_scatter.png')
+            if os.path.abspath(outp) != os.path.abspath(canonical):
+                import shutil as _sh
+                _sh.copyfile(outp, canonical)
+        except Exception:
+            pass
+        plt.close()
+    except Exception as e:
+        logging.warning(f"residual scatter failed: {e}")
+
+
+def save_error_tables(
+    df_test: pd.DataFrame,
+    y_true: np.ndarray | pd.Series,
+    y_pred: np.ndarray | pd.Series,
+    plot_dir: str,
+    stem: str,
+) -> dict:
+    """Create error CSVs to identify hard segments and cases.
+
+    Returns dict of generated paths.
+    """
+    out: dict = {}
+    try:
+        y = np.asarray(y_true, float).reshape(-1)
+        p = np.asarray(y_pred, float).reshape(-1)
+        n = min(len(y), len(p), len(df_test))
+        df = df_test.iloc[:n].copy()
+        df['y_true'] = y[:n]
+        df['y_pred'] = p[:n]
+        df['abs_err'] = np.abs(df['y_true'] - df['y_pred'])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df['ape'] = np.where(df['y_true'] > 0, df['abs_err'] / df['y_true'], np.nan)
+        # Worst 100 by absolute error
+        worst = df.sort_values('abs_err', ascending=False).head(100)
+        os.makedirs(plot_dir, exist_ok=True)
+        worst_path = os.path.join(plot_dir, f'worst_errors_{stem}.csv')
+        worst.to_csv(worst_path, index=False)
+        out['worst_errors'] = worst_path
+
+        # Segment metrics: by Bed, Property Type, Suburb (top 30), floor/floor bins
+        def _agg(group):
+            return pd.Series({
+                'n': int(group.shape[0]),
+                'MAE': float(group['abs_err'].mean()),
+                'MedAE': float(group['abs_err'].median()),
+                'MAPE': float(group['ape'].mean(skipna=True) * 100.0),
+            })
+        segs = []
+        if 'Bed' in df.columns:
+            bed = df.groupby(df['Bed'].astype(str)).apply(_agg).reset_index().rename(columns={'Bed':'segment'})
+            bed['group']='Bed'
+            segs.append(bed)
+        if 'Property Type' in df.columns:
+            pt = df.groupby(df['Property Type'].astype(str)).apply(_agg).reset_index().rename(columns={'Property Type':'segment'})
+            pt['group']='Property Type'
+            segs.append(pt)
+        if 'Suburb' in df.columns:
+            sb = df.groupby(df['Suburb'].astype(str)).apply(_agg).reset_index().rename(columns={'Suburb':'segment'})
+            sb = sb.sort_values('n', ascending=False).head(30)
+            sb['group']='Suburb'
+            segs.append(sb)
+        if 'Floor Size (sqm)' in df.columns:
+            fbin = pd.to_numeric(df['Floor Size (sqm)'], errors='coerce')
+            bins = pd.qcut(fbin, q=5, duplicates='drop')
+            fb = df.groupby(bins).apply(_agg).reset_index().rename(columns={'Floor Size (sqm)':'segment'})
+            fb['segment'] = fb['index'].astype(str); fb = fb.drop(columns=['index'])
+            fb['group']='Floor Size (bins)'
+            segs.append(fb)
+        if segs:
+            seg_all = pd.concat(segs, axis=0, ignore_index=True)
+            seg_path = os.path.join(plot_dir, f'error_segments_{stem}.csv')
+            seg_all.to_csv(seg_path, index=False)
+            out['segments'] = seg_path
+    except Exception as e:
+        logging.warning(f"error tables failed: {e}")
+    return out
+def save_shap_summary_catboost(
+    model,
+    X,
+    feature_names,
+    plot_dir: str,
+    stem: str | None = None,
+    artifact_path: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Save high‑quality SHAP summaries (beeswarm + bar) with sane sizing.
+
+    Best‑practice defaults:
+    - Use TreeExplainer on CatBoost model
+    - Limit to top_k features by mean(|SHAP|) to keep plots readable
+    - Beeswarm colored by feature values, plus compact bar summary
+    - Dynamic figure height; DPI=200 for clarity
+    Returns (beeswarm_path, bar_path)
+    """
+    shap_art, shap_plot = None, None
+    try:
+        import shap
+        import numpy as _np
+        import matplotlib.pyplot as plt
+
+        # Ensure directory exists
+        os.makedirs(plot_dir, exist_ok=True)
+
+        # Convert X to DataFrame with names for coloring in beeswarm
+        names = list(feature_names) if feature_names is not None else None
+        if hasattr(X, "shape") and names is not None and len(names) == getattr(X, "shape", [0])[1]:
+            try:
+                X_df = pd.DataFrame(X, columns=names)
+            except Exception:
+                X_df = pd.DataFrame(_np.asarray(X))
+        else:
+            X_df = pd.DataFrame(_np.asarray(X))
+            if names is None and hasattr(model, "feature_names_"):
+                names = list(getattr(model, "feature_names_"))
+            if names is None:
+                names = [f"f{i}" for i in range(X_df.shape[1])]
+            X_df.columns = names
+
+        # Compute SHAP values
+        explainer = shap.TreeExplainer(model)
+        shap_vals = explainer.shap_values(_np.array(X_df.values, copy=False))
+
+        # Rank features by global impact (mean absolute SHAP)
+        mean_abs = _np.abs(shap_vals).mean(axis=0)
+        order = _np.argsort(-mean_abs)
+        top_k = int(os.getenv("SHAP_MAX_DISPLAY", "25") or 25)
+        top_k = max(10, min(top_k, X_df.shape[1]))
+        top_idx = order[:top_k]
+
+        shap_top = shap_vals[:, top_idx]
+        X_top = X_df.iloc[:, top_idx]
+        names_top = [X_df.columns[i] for i in top_idx]
+
+        # 1) Beeswarm (artifact_path if provided)
+        try:
+            plt.close("all")
+            plt.figure(figsize=(10, max(6, 0.45 * top_k)))
+            shap.summary_plot(
+                shap_top,
+                features=X_top,
+                feature_names=names_top,
+                max_display=top_k,
+                show=False,
+            )
+            bees_out = artifact_path or os.path.join(plot_dir, f"shap_beeswarm_{stem or 'model'}.png")
+            plt.tight_layout()
+            plt.savefig(bees_out, dpi=200)
+            shap_art = bees_out
+        except Exception as _be:
+            logging.warning(f"SHAP beeswarm failed: {_be}")
+        finally:
+            plt.close()
+
+        # 2) Bar (global importance)
+        try:
+            plt.close("all")
+            plt.figure(figsize=(9, max(5, 0.35 * top_k)))
+            shap.summary_plot(
+                shap_top,
+                features=X_top,
+                feature_names=names_top,
+                plot_type="bar",
+                max_display=top_k,
+                show=False,
+            )
+            out_name = f"shap_summary_{stem}.png" if stem else "shap_summary.png"
+            out_path = os.path.join(plot_dir, out_name)
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=200)
+            shap_plot = out_path
+            logging.info(f"SHAP summary plot saved => {out_path}")
+        except Exception as _be2:
+            logging.warning(f"SHAP bar summary failed: {_be2}")
+        finally:
+            plt.close()
+    except Exception as e:
+        logging.warning(f"SHAP summary failed: {e}")
+    return shap_art, shap_plot
+
+
+###############################################################################
+# (B) Comprehensive Correlation Heatmap (All numeric columns, all rows)
+###############################################################################
+
+def plot_full_correlation_heatmap(
+    data: pd.DataFrame,
+    plot_dir: str,
+    filename: str = "correlation_heatmap_full.png",
+    method: str = "pearson",
+) -> str | None:
+    """Plot a comprehensive correlation heatmap across ALL numeric columns.
+
+    - Uses pairwise-complete observations (pandas .corr default)
+    - Dynamically sizes the figure based on number of features
+    - Annotates only when feature count is modest (<= 30)
+    """
+    try:
+        # Select numeric columns only
+        num_df = data.select_dtypes(include=[np.number]).copy()
+        # Drop columns with no variance or all-NaN
+        nunique = num_df.nunique(dropna=True)
+        keep_cols = nunique[nunique > 0].index.tolist()
+        num_df = num_df[keep_cols]
+        if num_df.empty:
+            logging.warning("Full correlation heatmap skipped: no numeric columns available.")
+            return None
+
+        corr = num_df.corr(method=method)
+        n = corr.shape[0]
+        # Dynamic figure size; cap extremes to keep file manageable
+        fig_w = max(12, min(0.6 * n, 40))
+        fig_h = max(10, min(0.5 * n, 36))
+
+        plt.figure(figsize=(fig_w, fig_h))
+        annotate = n <= 30
+        sns.heatmap(corr, annot=annotate, cmap="coolwarm", center=0, vmin=-1, vmax=1, fmt=".2f" if annotate else "")
+        plt.title(f"Comprehensive Correlation Heatmap ({method.title()})", fontsize=14)
+        plt.tight_layout()
+
+        os.makedirs(plot_dir, exist_ok=True)
+        out_path = os.path.join(plot_dir, filename)
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        logging.info(f"Full correlation heatmap saved => {out_path}")
+        return out_path
+    except Exception as e:
+        logging.error(f"Error in plot_full_correlation_heatmap: {e}")
+        logging.error(traceback.format_exc())
+        return None
+
+
+###############################################################################
+# (C) All-types Correlation Heatmap (includes non-numeric via safe encoding)
+###############################################################################
+
+def _encode_non_numeric_for_corr(
+    df: pd.DataFrame,
+    *,
+    max_ohe_levels: int = 20,
+) -> pd.DataFrame:
+    """Return a numeric-only DataFrame by encoding non-numeric columns for correlation plotting.
+
+    - Numeric: pass-through
+    - Boolean: cast to int
+    - Datetime: convert to int64 epoch (ns) scaled to days for readability
+    - Object/Category/String:
+      * If cardinality <= max_ohe_levels → one-hot encode
+      * Else → frequency encode to a single numeric column (proportion in [0,1])
+    """
+    work = df.copy()
+    blocks: list[pd.DataFrame] = []
+
+    # Numeric (includes floats/ints)
+    num_cols = work.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols:
+        blocks.append(work[num_cols])
+
+    # Booleans → int
+    bool_cols = work.select_dtypes(include=[bool]).columns.tolist()
+    for c in bool_cols:
+        work[c] = work[c].astype(int)
+    if bool_cols:
+        blocks.append(work[bool_cols])
+
+    # Datetime → epoch days
+    dt_cols = work.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
+    for c in dt_cols:
+        try:
+            # nan-safe: to_numpy returns NaT as NaT; fill with nan
+            vals = work[c].astype("datetime64[ns]").view("int64").astype(float)
+            vals = vals / (24 * 3600 * 1e9)  # convert ns → days
+            work[c + "__epoch_days"] = vals
+        except Exception:
+            continue
+    if dt_cols:
+        add_cols = [c + "__epoch_days" for c in dt_cols if (c + "__epoch_days") in work.columns]
+        if add_cols:
+            blocks.append(work[add_cols])
+
+    # Object / category / string
+    cat_like = work.select_dtypes(include=["object", "category", "string"]).columns.tolist()
+    for c in cat_like:
+        ser = work[c].astype("string").fillna("__MISSING__")
+        vc = ser.value_counts(dropna=False)
+        if len(vc) <= max_ohe_levels:
+            dummies = pd.get_dummies(ser, prefix=c, dtype=float)
+            blocks.append(dummies)
+        else:
+            freq = (vc / max(1, len(ser))).to_dict()
+            blocks.append(pd.DataFrame({c + "__freq": ser.map(freq).astype(float)}))
+
+    if not blocks:
+        return pd.DataFrame(index=df.index)
+    return pd.concat(blocks, axis=1)
+
+
+def plot_correlation_heatmap_alltypes(
+    data: pd.DataFrame,
+    plot_dir: str,
+    filename: str = "correlation_heatmap_alltypes.png",
+    method: str = "pearson",
+    max_ohe_levels: int = 20,
+    top_k: int = 40,
+    target_col: str | None = "Last Rental Price",
+    cluster: bool = True,
+) -> dict:
+    """Plot readable, Kaggle-style correlation visualizations including non-numeric columns.
+
+    - Encodes non-numeric for plotting only (no training impact)
+    - Generates two plots by default:
+        1) Top-K correlation heatmap (masked upper triangle, readable labels)
+        2) Clustered heatmap (clustermap) over the same Top-K subset
+
+    Returns a dict with paths of generated artifacts.
+    """
+    outputs: dict[str, str | None] = {"topk": None, "cluster": None, "full": None, "bars": None}
+    try:
+        enc = _encode_non_numeric_for_corr(data, max_ohe_levels=max_ohe_levels)
+        if enc.empty:
+            logging.warning("All-types correlation heatmap skipped: no encodable columns.")
+            return outputs
+        # Drop all-NaN or constant columns for stability
+        enc = enc.dropna(axis=1, how="all")
+        nunique = enc.nunique(dropna=False)
+        enc = enc.loc[:, nunique[nunique > 1].index]
+        if enc.empty:
+            logging.warning("All-types correlation heatmap skipped: encoded columns are constant/NaN.")
+            return outputs
+
+        corr = enc.corr(method=method)
+
+        # Select a readable subset of columns
+        cols_sel: list[str]
+        if target_col and target_col in corr.columns:
+            order = corr[target_col].abs().sort_values(ascending=False)
+            cols_sel = [c for c in order.index if c != target_col][: max(1, top_k)]
+            cols_sel = [target_col] + cols_sel
+        else:
+            mean_abs = corr.abs().mean().sort_values(ascending=False)
+            cols_sel = list(mean_abs.index[: max(1, top_k)])
+
+        corr_sub = corr.loc[cols_sel, cols_sel]
+
+        # 1) Top-K (triangle) heatmap
+        n = corr_sub.shape[0]
+        fig_w = max(12, min(0.42 * n + 6, 36))
+        fig_h = max(10, min(0.38 * n + 5, 30))
+        mask = np.triu(np.ones_like(corr_sub, dtype=bool), k=1)
+        plt.figure(figsize=(fig_w, fig_h))
+        annotate = n <= 25
+        ax = sns.heatmap(
+            corr_sub,
+            mask=mask,
+            cmap="coolwarm",
+            center=0,
+            vmin=-1,
+            vmax=1,
+            square=False,
+            linewidths=0.3,
+            linecolor="white",
+            cbar_kws={"shrink": 0.7},
+            annot=annotate,
+            fmt=".2f" if annotate else "",
+        )
+        plt.xticks(rotation=45, ha="right")
+        plt.yticks(rotation=0)
+        plt.title(f"Top-{len(cols_sel)} Correlations ({method.title()})", fontsize=14)
+        plt.tight_layout()
+        os.makedirs(plot_dir, exist_ok=True)
+        out_topk = os.path.join(plot_dir, filename.replace(".png", "_topk.png"))
+        plt.savefig(out_topk, dpi=170)
+        plt.close()
+        outputs["topk"] = out_topk
+
+        # 2) Clustered heatmap for structure discovery
+        if cluster and n >= 3:
+            try:
+                cg = sns.clustermap(
+                    corr_sub,
+                    cmap="coolwarm",
+                    center=0,
+                    vmin=-1,
+                    vmax=1,
+                    method="average",
+                    metric="euclidean",
+                    figsize=(max(10, min(0.35 * n + 6, 28)), max(10, min(0.35 * n + 6, 28))),
+                    cbar_pos=(0.02, 0.8, 0.03, 0.18),
+                )
+                cg.fig.suptitle("Clustered Correlation (Top-K)", y=1.02, fontsize=13)
+                out_cluster = os.path.join(plot_dir, filename.replace(".png", "_cluster.png"))
+                cg.savefig(out_cluster, dpi=170)
+                plt.close(cg.fig)
+                outputs["cluster"] = out_cluster
+            except Exception as e:
+                logging.warning(f"Clustered heatmap failed: {e}")
+
+        # Optional: full (unfiltered) heatmap only if small enough
+        if corr.shape[0] <= 60:
+            fig_w = max(12, min(0.35 * corr.shape[0] + 6, 36))
+            fig_h = max(10, min(0.30 * corr.shape[0] + 5, 30))
+            plt.figure(figsize=(fig_w, fig_h))
+            annotate = corr.shape[0] <= 20
+            sns.heatmap(corr, cmap="coolwarm", center=0, vmin=-1, vmax=1, annot=annotate, fmt=".2f" if annotate else "")
+            plt.xticks(rotation=45, ha="right")
+            plt.yticks(rotation=0)
+            plt.title(f"All-Types Correlation (Full, {method.title()})", fontsize=14)
+            plt.tight_layout()
+            out_full = os.path.join(plot_dir, filename)
+            plt.savefig(out_full, dpi=150)
+            plt.close()
+            outputs["full"] = out_full
+
+        return outputs
+    except Exception as e:
+        logging.error(f"Error in plot_correlation_heatmap_alltypes: {e}")
+        logging.error(traceback.format_exc())
+        return outputs
 
 
 def plot_average_price_per_month(data, date_col, price_col, plot_dir):
@@ -1432,3 +1925,26 @@ if not ENABLE_VWAP_PLOTS:
     plot_eq_interactive_beds_1_and_2 = _noop  # type: ignore
 
     logging.info("All VWAP-related plotting functions have been stubbed out (ENABLE_VWAP_PLOTS=False).")
+def save_cleaned_full_dataset(df: pd.DataFrame, plot_dir: str, stem: str | None = None) -> str | None:
+    try:
+        os.makedirs(plot_dir, exist_ok=True)
+        name = f"cleaned_full_{stem}.csv" if stem else "cleaned_full.csv"
+        path = os.path.join(plot_dir, name)
+        df.to_csv(path, index=False)
+        logging.info(f"Saved full cleaned dataset => {path}")
+        return path
+    except Exception as e:
+        logging.warning(f"Saving full cleaned dataset failed: {e}")
+        return None
+
+
+def save_dataframe_csv(df: pd.DataFrame, plot_dir: str, filename: str) -> str | None:
+    try:
+        os.makedirs(plot_dir, exist_ok=True)
+        path = os.path.join(plot_dir, filename)
+        df.to_csv(path, index=False)
+        logging.info(f"Saved CSV => {path}")
+        return path
+    except Exception as e:
+        logging.warning(f"Saving CSV failed: {e}")
+        return None

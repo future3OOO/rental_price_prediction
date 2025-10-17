@@ -1,5 +1,1 @@
-Suburb,Last Rental Date,Last Rental Price,Bed,Bath,Capital Value,__geo_query__,_log_rent,_log_cap,z_rent,z_cap,votes,maha,reason,z_Bath,z__log_cap,z__log_rent
-,,,,,,,,,,,,,,0.0,-0.6745,-0.6745
-,,,,,,,,,,,,,,-0.6745,-0.6744999999999298,-0.6745
-,,,,,,,,,,,,,,0.0,0.6745,0.6745
-,,,,,,,,,,,,,,0.6745,0.67450000000007,0.6745
+Suburb,Last Rental Date,Last Rental Price,Bed,Bath,Capital Value,__geo_query__,Latitude,Longitude,_log_rent,_log_cap,z_rent,z_cap,votes,maha,reason,z_Bath,z_Latitude,z_Longitude,z__log_cap,z__log_rent
