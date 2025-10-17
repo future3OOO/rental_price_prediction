@@ -1,6 +1,0 @@
-Street Address,Suburb,Postcode,Bed,Bath,Car,Land Size (m²),Floor Size (m²),Year Built,Last Rental Price,Last Rental Date,Days on Market,Active Listing,Capital Value,Living Space (m²),zscore
-48 VAGUES ROAD ,"Northcote, Christchurch",8052,3,1,2,819.0,107,1940,330.0,2024-03-21,8,False,860000.0,107,-3.038269176347255
-22 JOCELYN STREET ,"Casebrook, Christchurch",8051,3,1,2,610.0,155,1950,270.0,2024-08-31,42,True,720000.0,155,-3.8274300013725164
-18 OAKLAND STREET ,"Northcote, Christchurch",8052,3,1,1,625.0,100,1950,210.0,2023-10-05,22,False,520000.0,100,-4.616590826397777
-14 OPAL PLACE ,"Casebrook, Christchurch",8051,3,1,1,627.0,100,1960,180.0,2023-12-13,78,False,620000.0,100,-5.011171238910408
-142 HIGHSTED ROAD ,"Casebrook, Christchurch",8051,3,1,2,638.0,183,1960,580.0,2023-09-28,7,False,760000.0,183,3.3978986788986205
