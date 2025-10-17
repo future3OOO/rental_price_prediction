@@ -72,24 +72,3 @@ node_modules/
 # Task files
 tasks.json
 tasks/ 
-
-# Local analysis artifacts
-analysis_plots_*/
-plots - Copy/
-studies/
-cache/
-cache_dir/
-*.log
-.cursorrules
-generate_html_report.html
-geospatial_analysis.py
-model_training.log
-output.txt
-project structure.txt
-project.md
-statistical_tests.py
-test_column_transformer.py
-test_sklearn.py
-time_series_analysis.py
-view_model.py
-\) here are the main source code files.py

@@ -1,0 +1,22 @@
+rental_price_prediction/
+├── config.py
+├── data_cleaning.py
+├── data_preparation.py
+├── data_loading.py
+├── plotting.py
+├── eda.py
+├── feature_engineering.py
+├── geospatial_analysis.py
+├── interactive_visualizations.py
+├── main.py
+├── mean_target_encoder.py
+├── model_interpretation.py
+├── model_training.py  
+├── outlier_removal.py
+├── prediction.py
+├── reproducibility.py
+├── statistical_tests.py
+├── time_series_analysis.py
+├── utils.py
+├── view_model.py
+└── requirements.txt
